@@ -1,4 +1,4 @@
---// Server Hopper v0.3 — vicious bee
+--// Server Hopper v0.4 — vicious bee + safe ColorSequence
 local players = game:GetService("Players")
 local httpService = game:GetService("HttpService")
 local userInput = game:GetService("UserInputService")
@@ -16,7 +16,7 @@ _G.__hopper_loaded = true
 local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
 
 -- ============ CONSTANTS ============
-local VERSION = "v0.3 beta"
+local VERSION = "v0.4 beta"
 local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
 local blacklistFile = "hopper_blacklist.json"
 local configFile = "hopper_config.json"
@@ -39,6 +39,50 @@ local function clamp(n, a, b) return math.max(a, math.min(b, n)) end
 
 local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
 local WHITE = rgb(255, 255, 255)
+
+-- ============ SAFE COLORSEQUENCE ============
+-- Wraps ColorSequence.new so any bad call (0 or 1 keypoint in a table, nil args, etc.)
+-- is caught, logged with a traceback, and replaced with a safe fallback.
+local realColorSequenceNew = ColorSequence.new
+
+local function safeCS(...)
+    local ok, res = pcall(realColorSequenceNew, ...)
+    if ok and typeof(res) == "ColorSequence" then return res end
+
+    -- Log what went wrong
+    warn("[hopper] bad ColorSequence.new call — falling back to white")
+    warn("[hopper] traceback:")
+    warn(debug.traceback("", 2))
+
+    local n = select("#", ...)
+    if n == 1 then
+        local t = ...
+        if type(t) == "table" then
+            warn("[hopper] table arg had " .. #t .. " entries")
+            if #t >= 1 and t[1] and t[1].Value then
+                local v = t[1].Value
+                return realColorSequenceNew(v, v)
+            end
+        end
+    elseif n >= 2 then
+        warn("[hopper] called with " .. n .. " args")
+        -- try passing them through; if that fails, white/white
+        local ok2, res2 = pcall(realColorSequenceNew, ...)
+        if ok2 then return res2 end
+    end
+    return realColorSequenceNew(WHITE, WHITE)
+end
+
+-- Sanity check: does ColorSequence.new even work on this executor?
+do
+    local ok, err = pcall(function()
+        return realColorSequenceNew(Color3.new(1, 1, 1), Color3.new(0, 0, 0))
+    end)
+    if not ok then
+        warn("[hopper] ColorSequence.new is broken on this executor: " .. tostring(err))
+    end
+end
+
 local ck, nk = function(t, r, g, b) return ColorSequenceKeypoint.new(t, rgb(r, g, b)) end, NumberSequenceKeypoint.new
 
 local C = {
@@ -87,7 +131,9 @@ local function stroke(o, color, thick, transp)
 end
 
 local function gradient(o, color, transparency, rot)
-    local g = new("UIGradient", {Color = color, Rotation = rot or 90}, nil)
+    local g = Instance.new("UIGradient")
+    g.Rotation = rot or 90
+    if color then g.Color = color end
     if transparency then g.Transparency = transparency end
     g.Parent = o
     return g
@@ -122,7 +168,7 @@ local function lerpColorSeq(a, b, t)
     for i = 1, #ka do
         out[i] = ColorSequenceKeypoint.new(ka[i].Time, ka[i].Value:Lerp(kb[i].Value, t))
     end
-    return ColorSequence.new(out)
+    return safeCS(out)
 end
 
 local seqTokens = setmetatable({}, {__mode = "k"})
@@ -206,7 +252,6 @@ if not httpRequest then logWarn("no http request function found — using HttpGe
 local config = {
     maxPages = 15, minPlayers = 1, maxPlayerRatio = 0.9,
     autoHopDelay = 4, hopOnJoin = false, preferLessFull = true, skipEmpty = true,
-    -- [VICIOUS BEE]
     viciousBeeMode = false,
     viciousBeeAutoRehop = true,
     viciousBeeWaitTime = 6,
@@ -215,7 +260,6 @@ local config = {
 }
 local persistConfig = {
     themeIdx = 1, scale = 1, preferLessFull = true, skipEmpty = true, hopOnJoin = false,
-    -- [VICIOUS BEE]
     viciousBeeMode = false,
     viciousBeeAutoRehop = true,
 }
@@ -316,7 +360,7 @@ local function shortId(id)
     return #id > 10 and id:sub(1, 10) or id
 end
 
--- ============ [VICIOUS BEE] DETECTION ============
+-- ============ VICIOUS BEE DETECTION ============
 local function normalizeName(s)
     return (tostring(s):lower():gsub("[%s_%-%.]", ""))
 end
@@ -406,8 +450,10 @@ end
 local function setBg(c1, c2, c3)
     U.shown = {c1, c2, c3}
     if U.bgGrad then
-        U.bgGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, c1), ColorSequenceKeypoint.new(0.5, c2), ColorSequenceKeypoint.new(1, c3),
+        U.bgGrad.Color = safeCS({
+            ColorSequenceKeypoint.new(0, c1),
+            ColorSequenceKeypoint.new(0.5, c2),
+            ColorSequenceKeypoint.new(1, c3),
         })
     end
 end
@@ -416,7 +462,7 @@ local function setAccent(listener, hi, base, animated)
     local o = listener.obj
     if not (o and o.Parent) then return end
     if listener.use == "grad" then
-        local seq = ColorSequence.new(hi, base)
+        local seq = safeCS(hi, base)
         if animated then tw(o, {Color = seq}, 0.6) else o.Color = seq end
     else
         local target = (listener.use == "hi") and hi or base
@@ -668,10 +714,10 @@ local function glassSurface(parent, order)
         ZIndex = 5, LayoutOrder = order or 0,
     }, parent)
     corner(f, 12)
-    gradient(f, ColorSequence.new({ck(0, 255, 255, 255), ck(0.6, 230, 232, 240), ck(1, 200, 205, 218)}),
+    gradient(f, safeCS({ck(0, 255, 255, 255), ck(0.6, 230, 232, 240), ck(1, 200, 205, 218)}),
         NumberSequence.new(0.86, 0.94), 90)
     local st = stroke(f, WHITE, 1, 0)
-    gradient(st, ColorSequence.new({ck(0, 255, 255, 255), ck(0.5, 200, 210, 230), ck(1, 140, 148, 168)}),
+    gradient(st, safeCS({ck(0, 255, 255, 255), ck(0.5, 200, 210, 230), ck(1, 140, 148, 168)}),
         NumberSequence.new({nk(0, 0.4), nk(0.5, 0.68), nk(1, 0.85)}), 90)
     return f
 end
@@ -683,9 +729,9 @@ local function glassButton(parent, height, order)
         ZIndex = 5, LayoutOrder = order or 0,
     }, parent)
     corner(b, 10)
-    local g = gradient(b, ColorSequence.new(WHITE, rgb(210, 214, 226)), NumberSequence.new(0.85, 0.93), 90)
+    local g = gradient(b, safeCS(WHITE, rgb(210, 214, 226)), NumberSequence.new(0.85, 0.93), 90)
     local st = stroke(b, WHITE, 1, 0)
-    local sg = gradient(st, ColorSequence.new(WHITE, rgb(150, 158, 178)), NumberSequence.new(0.5, 0.82), 90)
+    local sg = gradient(st, safeCS(WHITE, rgb(150, 158, 178)), NumberSequence.new(0.5, 0.82), 90)
     b.MouseEnter:Connect(function()
         tw(g, {Transparency = NumberSequence.new(0.78, 0.88)}, 0.22)
         tw(sg, {Transparency = NumberSequence.new(0.35, 0.7)}, 0.22)
@@ -812,8 +858,8 @@ function U.renderServerList(list)
             Size = UDim2.new(1, 0, 0, 38), Text = "", AutoButtonColor = false, LayoutOrder = i, ZIndex = 6,
         }, frame)
         corner(row, 10)
-        gradient(row, s.cur and ColorSequence.new(rgb(140, 180, 240), rgb(80, 120, 190))
-            or ColorSequence.new(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.88, 0.95), 90)
+        gradient(row, s.cur and safeCS(rgb(140, 180, 240), rgb(80, 120, 190))
+            or safeCS(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.88, 0.95), 90)
         stroke(row, WHITE, 1, 0.65)
 
         local dotColor = s.cur and C.green or (s.bad and C.red or (s.isFull and C.yellow or C.accent))
@@ -902,7 +948,7 @@ local function buildUI()
     }, container)
     corner(win, 16)
     local winStroke = stroke(win, WHITE, 1, 0)
-    gradient(winStroke, ColorSequence.new(WHITE, rgb(140, 148, 168)), NumberSequence.new(0.5, 0.88), 90)
+    gradient(winStroke, safeCS(WHITE, rgb(140, 148, 168)), NumberSequence.new(0.5, 0.88), 90)
 
     local bgLayer = new("Frame", {
         BackgroundColor3 = rgb(14, 14, 20), BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0),
@@ -910,8 +956,7 @@ local function buildUI()
     }, win)
     corner(bgLayer, 16)
     local t0 = themes[currentThemeIdx]
-    -- FIX: two keypoints (placeholder, overwritten immediately by setBg)
-    local bgGrad = gradient(bgLayer, ColorSequence.new(rgb(0, 0, 0), rgb(0, 0, 0)), nil, 35)
+    local bgGrad = gradient(bgLayer, safeCS(rgb(0, 0, 0), rgb(0, 0, 0)), nil, 35)
     U.bgGrad = bgGrad
     setBg(t0.c1, t0.c2, t0.c3)
     bgGrad.Transparency = NumberSequence.new({nk(0, 0.4), nk(0.5, 0.62), nk(1, 0.4)})
@@ -965,7 +1010,7 @@ local function buildUI()
         Size = UDim2.new(0, 34, 0, 34), LayoutOrder = 1, ZIndex = 6,
     }, hLeft)
     corner(iconBox, 9)
-    gradient(iconBox, ColorSequence.new(WHITE, rgb(200, 205, 218)), nil, 90)
+    gradient(iconBox, safeCS(WHITE, rgb(200, 205, 218)), nil, 90)
     stroke(iconBox, WHITE, 1, 0.5)
     local iconImg = new("ImageLabel", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0), Image = iconId, ZIndex = 7}, iconBox)
     corner(iconImg, 9)
@@ -999,7 +1044,7 @@ local function buildUI()
     local function iconBtn(txt, order)
         local b, l = makeBtn(hRight, {
             size = UDim2.new(0, 24, 0, 24), bg = WHITE, bgT = 0.85, r = 7, order = order,
-            grad = ColorSequence.new(WHITE, rgb(210, 215, 228)), text = txt, tsize = 14,
+            grad = safeCS(WHITE, rgb(210, 215, 228)), text = txt, tsize = 14,
             tcolor = C.textMid, strokeT = 0.55,
         })
         return b, l
@@ -1039,7 +1084,7 @@ local function buildUI()
         Size = UDim2.new(tabW, -80, 0, 3), Position = UDim2.new(0, 40, 1, -4), ZIndex = 7,
     }, tabsBar)
     corner(tabUnderline, "full")
-    local tuG = gradient(tabUnderline, ColorSequence.new(C.accentHi, C.accent),
+    local tuG = gradient(tabUnderline, safeCS(C.accentHi, C.accent),
         NumberSequence.new({nk(0, 0.6), nk(0.5, 0), nk(1, 0.6)}), 0)
     registerAccent(tuG, "Color", "grad")
 
@@ -1101,7 +1146,7 @@ local function buildUI()
 
     local hopBtn, _, sbGrad, sbStroke = makeBtn(inputBar, {
         size = UDim2.new(0.55, -16, 0, 32), pos = UDim2.new(0, 14, 0, 30), bg = C.accent,
-        grad = ColorSequence.new(C.accentHi, C.accent), text = "hop now", tsize = 12,
+        grad = safeCS(C.accentHi, C.accent), text = "hop now", tsize = 12,
     })
     registerAccent(hopBtn, "BackgroundColor3", "accent")
     registerAccent(sbGrad, "Color", "grad")
@@ -1109,7 +1154,7 @@ local function buildUI()
 
     local clearBtn = makeBtn(inputBar, {
         size = UDim2.new(0.45, -16, 0, 32), pos = UDim2.new(0.55, 2, 0, 30), bg = WHITE, bgT = 0.8,
-        grad = ColorSequence.new(WHITE, rgb(210, 215, 228)), text = "clear log", tcolor = C.text,
+        grad = safeCS(WHITE, rgb(210, 215, 228)), text = "clear log", tcolor = C.text,
     })
     clearBtn.MouseEnter:Connect(function() tw(clearBtn, {BackgroundTransparency = 0.7}, 0.18) end)
     clearBtn.MouseLeave:Connect(function() tw(clearBtn, {BackgroundTransparency = 0.8}, 0.22) end)
@@ -1131,7 +1176,7 @@ local function buildUI()
     })
     local refreshBtn, _, rsbGrad, rsbStroke = makeBtn(serverStatusCard, {
         size = UDim2.new(0, 88, 0, 32), pos = UDim2.new(1, -104, 0.5, -16), bg = C.accent,
-        grad = ColorSequence.new(C.accentHi, C.accent), text = "refresh",
+        grad = safeCS(C.accentHi, C.accent), text = "refresh",
     })
     registerAccent(refreshBtn, "BackgroundColor3", "accent")
     registerAccent(rsbGrad, "Color", "grad")
@@ -1170,11 +1215,11 @@ local function buildUI()
             Text = "", AutoButtonColor = false, LayoutOrder = i, ZIndex = 6,
         }, swatchRow)
         if t.rainbow then
-            gradient(sw, ColorSequence.new({
+            gradient(sw, safeCS({
                 ck(0, 255, 80, 80), ck(0.25, 255, 220, 80), ck(0.5, 120, 255, 120), ck(0.75, 120, 180, 255), ck(1, 220, 120, 255),
             }), nil, 45)
         else
-            gradient(sw, ColorSequence.new(WHITE:Lerp(t.c1, 0.6), t.c1), nil, 90)
+            gradient(sw, safeCS(WHITE:Lerp(t.c1, 0.6), t.c1), nil, 90)
         end
         corner(sw, "full")
         local active = (i == currentThemeIdx)
@@ -1210,7 +1255,7 @@ local function buildUI()
         local b = makeBtn(scaleCard, {
             size = UDim2.new(0, 34, 0, 30),
             pos = UDim2.new(1, -(34 * (4 - order) + 12 + (3 - order) * 6), 0.5, -15),
-            bg = WHITE, bgT = 0.8, grad = ColorSequence.new(WHITE, rgb(210, 215, 228)),
+            bg = WHITE, bgT = 0.8, grad = safeCS(WHITE, rgb(210, 215, 228)),
             text = txt, tsize = 13, tcolor = C.text, strokeT = 0.6,
         })
         b.MouseEnter:Connect(function() tw(b, {BackgroundTransparency = 0.68}, 0.18) end)
@@ -1254,7 +1299,7 @@ local function buildUI()
         Size = UDim2.new(1, 0, 0, 52), Text = "", AutoButtonColor = false, LayoutOrder = 13, ZIndex = 5,
     }, tScroll)
     corner(unloadBtn, 10)
-    gradient(unloadBtn, ColorSequence.new(rgb(220, 75, 90), rgb(150, 40, 55)), nil, 90)
+    gradient(unloadBtn, safeCS(rgb(220, 75, 90), rgb(150, 40, 55)), nil, 90)
     stroke(unloadBtn, rgb(255, 200, 210), 1, 0.5)
     lbl(unloadBtn, "unload hopper", F.bold, 12, rgb(255, 245, 250), {
         Size = UDim2.new(1, 0, 0, 18), Position = UDim2.new(0, 16, 0, 10), ZIndex = 6,
@@ -1284,7 +1329,7 @@ local function buildUI()
     local function actionBtn(txt, color, order, cb)
         local b, _, _, s = makeBtn(actionRow, {
             size = UDim2.new(0.5, -4, 1, 0), bg = color, order = order, r = 10,
-            grad = ColorSequence.new(WHITE:Lerp(color, 0.5), color), text = txt,
+            grad = safeCS(WHITE:Lerp(color, 0.5), color), text = txt,
         })
         hoverStroke(b, s)
         b.MouseButton1Click:Connect(cb)
@@ -1325,14 +1370,14 @@ local function buildUI()
                 Size = UDim2.new(1, 0, 0, 38), LayoutOrder = i, ZIndex = 6,
             }, blListFrame)
             corner(row, 10)
-            gradient(row, ColorSequence.new(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.88, 0.95), 90)
+            gradient(row, safeCS(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.88, 0.95), 90)
             stroke(row, WHITE, 1, 0.65)
             lbl(row, id, F.code, 10, C.text, {
                 Size = UDim2.new(1, -100, 1, 0), Position = UDim2.new(0, 14, 0, 0), TextTruncate = Enum.TextTruncate.AtEnd,
             })
             local del = makeBtn(row, {
                 size = UDim2.new(0, 70, 0, 24), pos = UDim2.new(1, -82, 0.5, -12), bg = rgb(200, 70, 85), bgT = 0.2,
-                r = 7, z = 7, grad = ColorSequence.new(rgb(220, 90, 105), rgb(160, 50, 65)),
+                r = 7, z = 7, grad = safeCS(rgb(220, 90, 105), rgb(160, 50, 65)),
                 text = "remove", tsize = 10, tcolor = rgb(255, 240, 245), strokeT = 1,
             })
             del.MouseEnter:Connect(function() tw(del, {BackgroundTransparency = 0}, 0.18) end)
@@ -1374,7 +1419,7 @@ local function buildUI()
         BackgroundColor3 = WHITE, BackgroundTransparency = 0.82, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), ZIndex = 200,
     }, pill)
     corner(pillBg, "full")
-    gradient(pillBg, ColorSequence.new(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.78, 0.88), 90)
+    gradient(pillBg, safeCS(WHITE, rgb(210, 215, 228)), NumberSequence.new(0.78, 0.88), 90)
     stroke(pillBg, WHITE, 1, 0.5)
     local pillIconBox = new("Frame", {
         BackgroundTransparency = 1, Size = UDim2.new(0, 30, 0, 30), Position = UDim2.new(0, 8, 0.5, -15), ZIndex = 201,
@@ -1424,7 +1469,7 @@ if not ok then
     return
 end
 
--- ============ [VICIOUS BEE] MONITOR ============
+-- ============ VICIOUS BEE MONITOR ============
 local vbeeMonitorToken = 0
 function startViciousBeeMonitor()
     vbeeMonitorToken = vbeeMonitorToken + 1
