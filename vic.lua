@@ -1,4 +1,4 @@
---// Server Hopper v0.5 — cool UI + old vicious bee detection
+--// Server Hopper v0.6 — vic scout + atlas + auto-hop when gone
 local players = game:GetService("Players")
 local httpService = game:GetService("HttpService")
 local userInput = game:GetService("UserInputService")
@@ -16,7 +16,7 @@ _G.__hopper_loaded = true
 local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
 
 -- ============ CONSTANTS ============
-local VERSION = "v0.5 beta"
+local VERSION = "v0.6 beta"
 local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
 local blacklistFile = "hopper_blacklist.json"
 local configFile = "hopper_config.json"
@@ -26,6 +26,9 @@ local MAX_SESSION_LOGS = 200
 local MAX_ROWS = 120
 local WIN_W, WIN_H = 460, 580
 local HEADER_H, TABS_H = 58, 36
+
+-- [ATLAS] ← put the real loadstring URL here
+local ATLAS_LOADSTRING = "loadstring(game:HttpGet('https://pastebin.com/raw/REPLACE_ME'))()"
 
 -- ============ STATE ============
 local U = {}
@@ -222,8 +225,7 @@ local config = {
     viciousBeeMode = false,
     viciousBeeAutoRehop = true,
     viciousBeeWaitTime = 6,
-    viciousBeeRecheckInterval = 10,
-    -- folder names to look inside for the bee (case-insensitive)
+    viciousBeeRecheckInterval = 5,
     viciousBeeFolders = {"Monsters", "monsters", "Enemies", "enemies", "NPCs", "npcs", "Mobs", "mobs"},
 }
 local persistConfig = {
@@ -328,9 +330,7 @@ local function shortId(id)
     return #id > 10 and id:sub(1, 10) or id
 end
 
--- ============ VICIOUS BEE DETECTION (old Monsters-folder logic) ============
--- Old logic: the Vicious Bee lives inside a "Monsters" folder (or similar)
--- in workspace. Walk that folder and check for anything with "vicious" in the name.
+-- ============ VICIOUS BEE DETECTION (Monsters folder) ============
 local function isViciousName(name)
     local n = tostring(name):lower()
     return n:find("vicious", 1, true) ~= nil
@@ -341,11 +341,9 @@ local function checkForViciousBee()
     local containerFound = nil
     local found = nil
 
-    -- Try each known folder name in order
     for _, folderName in ipairs(config.viciousBeeFolders) do
         local folder = workspace:FindFirstChild(folderName)
         if not folder then
-            -- also try case-insensitive scan of workspace children (covers odd capitalizations)
             for _, child in ipairs(workspace:GetChildren()) do
                 if tostring(child.Name):lower() == folderName:lower() then
                     folder = child
@@ -369,8 +367,6 @@ local function checkForViciousBee()
         if found then break end
     end
 
-    -- Fallback: no Monsters folder anywhere — do a shallow workspace scan
-    -- for anything named like the bee directly (belt-and-suspenders).
     if not containerFound then
         for _, child in ipairs(workspace:GetChildren()) do
             scanned = scanned + 1
@@ -496,7 +492,8 @@ local function setStatus(state, txt)
     local col, label = C.red, txt or "idle"
     if state == "ok" then col, label = C.green, txt or "ready"
     elseif state == "loading" then col, label = C.yellow, txt or "scanning"
-    elseif state == "bee" then col, label = rgb(255, 200, 60), txt or "bee found" end
+    elseif state == "bee" then col, label = rgb(255, 200, 60), txt or "bee found"
+    elseif state == "watch" then col, label = rgb(180, 130, 255), txt or "watching bee" end
     if U.statusDot then tw(U.statusDot, {BackgroundColor3 = col}, 0.36) end
     if U.statusRing then tw(U.statusRing, {Color = col}, 0.36) end
     if U.pillDot then tw(U.pillDot, {BackgroundColor3 = col}, 0.36) end
@@ -1245,13 +1242,13 @@ local function buildUI()
     toggleRow(tScroll, "vicious bee mode", config.viciousBeeMode, function(v)
         config.viciousBeeMode = v
         if v then
-            logInfo("vicious bee mode enabled — will hop until found")
+            logInfo("vicious bee mode enabled")
             startViciousBeeMonitor()
         else
             logInfo("vicious bee mode disabled")
         end
     end, 8.1, "viciousBeeMode")
-    toggleRow(tScroll, "auto-rehop if bee dies", config.viciousBeeAutoRehop, function(v)
+    toggleRow(tScroll, "auto-rehop when bee gone", config.viciousBeeAutoRehop, function(v)
         config.viciousBeeAutoRehop = v
     end, 8.2, "viciousBeeAutoRehop")
 
@@ -1437,8 +1434,10 @@ if not ok then
     return
 end
 
--- ============ VICIOUS BEE MONITOR ============
+-- ============ VICIOUS BEE MONITOR (scout → atlas → wait → hop) ============
 local vbeeMonitorToken = 0
+local atlasLoaded = false
+
 function startViciousBeeMonitor()
     vbeeMonitorToken = vbeeMonitorToken + 1
     local my = vbeeMonitorToken
@@ -1446,24 +1445,46 @@ function startViciousBeeMonitor()
         task.wait(config.viciousBeeWaitTime)
         if unloaded or my ~= vbeeMonitorToken then return end
 
+        -- 1. SCOUT: check current server for the bee
         local bee, scanned, folder = checkForViciousBee()
-        if bee then
-            logGood("vicious bee found: " .. bee:GetFullName() .. " (" .. scanned .. " checked in " ..
-                (folder and folder.Name or "workspace") .. ")")
-            setStatus("bee", "bee found")
-            if U.headerSub then U.headerSub.Text = "bee · " .. bee.Name end
-        else
-            logWarn("vicious bee not found (" .. scanned .. " checked)")
-            if not folder then
-                logWarn("no Monsters folder found in workspace")
-            end
+        if not bee then
+            logWarn("vic not found in this server (" .. scanned .. " checked)")
+            if not folder then logWarn("no Monsters folder found") end
             setStatus("ok", "no bee")
             if config.viciousBeeAutoRehop and not hopping then
-                logInfo("auto-rehop to find a fresh server")
+                logInfo("hopping to find a server with a vic")
                 doHop()
                 return
             end
+            -- if auto-rehop is off, still idle here
+            return
         end
+
+        -- 2. FOUND: bee is here
+        logGood("vic found: " .. bee:GetFullName() .. " (" .. scanned .. " checked in " ..
+            (folder and folder.Name or "workspace") .. ")")
+        setStatus("bee", "bee found")
+        if U.headerSub then U.headerSub.Text = "bee · " .. bee.Name end
+
+        -- 3. ATLAS: run the loadstring once per session
+        if not atlasLoaded then
+            atlasLoaded = true
+            logInfo("running atlas loadstring")
+            local okL, errL = pcall(function()
+                loadstring(ATLAS_LOADSTRING)()
+            end)
+            if not okL then
+                logBad("atlas loadstring failed: " .. tostring(errL))
+            else
+                logGood("atlas loaded")
+            end
+        else
+            log("atlas already loaded this session")
+        end
+
+        -- 4. WATCH: sit still, wait for the bee to leave
+        logInfo("watching for vic to disappear...")
+        setStatus("watch", "watching bee")
 
         while not unloaded and my == vbeeMonitorToken and config.viciousBeeMode do
             task.wait(config.viciousBeeRecheckInterval)
@@ -1471,16 +1492,18 @@ function startViciousBeeMonitor()
 
             local b, sc = checkForViciousBee()
             if b then
+                -- still here
                 if U.headerSub then U.headerSub.Text = "bee · " .. b.Name end
                 setStatus("bee", "bee found")
             else
+                -- gone
+                logWarn("vic disappeared — hopping")
                 if U.headerSub then U.headerSub.Text = "session " .. sessionId end
                 setStatus("ok", "no bee")
                 if config.viciousBeeAutoRehop and not hopping then
-                    logWarn("vicious bee gone — hopping for a fresh server")
                     doHop()
-                    return
                 end
+                return
             end
         end
     end)
@@ -1519,7 +1542,7 @@ log("current job: " .. (currentServerId and shortId(currentServerId) or "unknown
 log("hop on join: " .. (config.hopOnJoin and "ON" or "OFF"))
 
 if config.viciousBeeMode then
-    logInfo("vicious bee mode: ON — checking this server first")
+    logInfo("vicious bee mode: ON — scouting this server")
     logInfo("rightshift toggle · F2 hop · F3 scan · F4 bee check")
     setStatus("loading", "bee check")
     startViciousBeeMonitor()
