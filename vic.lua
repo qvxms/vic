@@ -1,4 +1,4 @@
---// Auto-execute server hopper v2
+--// Auto-execute server hopper v3 — GUI fix
 if _G.__ServerHopperRan then return end
 _G.__ServerHopperRan = true
 
@@ -6,18 +6,18 @@ local ts = game:GetService("TeleportService")
 local ps = game:GetService("Players")
 local hs = game:GetService("HttpService")
 local lp = ps.LocalPlayer
-local cg = game:GetService("CoreGui")
 local UIS = game:GetService("UserInputService")
 
 local requestFunc = (syn and syn.request) or http_request or request
 
 --// Config
 local BLACKLIST_FILE = "server_blacklist.json"
-local MAX_PAGES = 15            -- dig deeper
+local MAX_PAGES = 15
 local MIN_PLAYERS = 1
-local MAX_PLAYER_RATIO = 1.0    -- accept full-ish servers as last resort
+local MAX_PLAYER_RATIO = 1.0
 local AUTO_HOP_DELAY = 3
 local HOP_ON_JOIN = true
+local GUI_POSITION = UDim2.new(1, -400, 0, 60)  -- top-right below topbar
 
 --// Blacklist
 local blacklist = {}
@@ -44,18 +44,32 @@ if currentJobId ~= "" then
     saveBlacklist()
 end
 
---// GUI
+--// Ensure PlayerGui exists
+local playerGui = lp:FindFirstChildOfClass("PlayerGui")
+if not playerGui then
+    playerGui = lp:WaitForChild("PlayerGui", 5)
+end
+if not playerGui then
+    warn("[ServerHopper] PlayerGui not found — aborting GUI")
+    return
+end
+
+--// GUI — parent to PlayerGui (safest across executors)
 local gui = Instance.new("ScreenGui")
 gui.Name = "ServerHopperLogs"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.Enabled = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = (pcall(function() return cg end) and cg) or lp:WaitForChild("PlayerGui")
+gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
+frame.Name = "LogFrame"
 frame.BackgroundTransparency = 1
-frame.Position = UDim2.new(0, 20, 0, 20)
-frame.Size = UDim2.new(0, 380, 0, 280)
+frame.Position = GUI_POSITION
+frame.Size = UDim2.new(0, 380, 0, 300)
+frame.Visible = true
 frame.Parent = gui
 
 local layout = Instance.new("UIListLayout")
@@ -68,16 +82,16 @@ header.BackgroundTransparency = 1
 header.Font = Enum.Font.Code
 header.TextSize = 15
 header.TextColor3 = Color3.fromRGB(255, 255, 255)
-header.TextStrokeTransparency = 0.4
+header.TextStrokeTransparency = 0.2
 header.TextXAlignment = Enum.TextXAlignment.Left
-header.Size = UDim2.new(1, 0, 0, 18)
+header.Size = UDim2.new(1, 0, 0, 20)
 header.Text = "server hopper"
 header.LayoutOrder = 1
 header.Parent = frame
 
 local logHolder = Instance.new("Frame")
 logHolder.BackgroundTransparency = 1
-logHolder.Size = UDim2.new(1, 0, 0, 250)
+logHolder.Size = UDim2.new(1, 0, 0, 270)
 logHolder.LayoutOrder = 2
 logHolder.Parent = frame
 
@@ -91,14 +105,17 @@ local MAX_LOGS = 18
 
 local function pushLog(text, color)
     color = color or Color3.fromRGB(220, 220, 220)
+    print("[ServerHopper] " .. text)  -- console fallback
+
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Font = Enum.Font.Code
     label.TextSize = 13
     label.TextColor3 = color
-    label.TextStrokeTransparency = 0.6
+    label.TextStrokeTransparency = 0.3
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextWrapped = true
+    label.AutomaticSize = Enum.AutomaticSize.Y
     label.Size = UDim2.new(1, 0, 0, 14)
     label.Text = "› " .. text
     label.LayoutOrder = #logs + 1
@@ -141,7 +158,6 @@ local function fetchPage(cursor)
         if ok then body = res end
     end
     if not body then return nil end
-
     local ok, decoded = pcall(function() return hs:JSONDecode(body) end)
     return ok and decoded or nil
 end
@@ -188,7 +204,6 @@ local function tryApiHop()
         Color3.fromRGB(150, 255, 180))
 
     if currentJobId ~= "" then addToBlacklist(currentJobId) end
-
     task.wait(0.5)
 
     local ok = pcall(function()
@@ -196,32 +211,18 @@ local function tryApiHop()
         opts.ServerInstanceId = chosen.id
         ts:TeleportAsync(game.PlaceId, { lp }, opts)
     end)
-
     if not ok then
-        pcall(function()
-            ts:TeleportToPlaceInstance(game.PlaceId, chosen.id, lp)
-        end)
+        pcall(function() ts:TeleportToPlaceInstance(game.PlaceId, chosen.id, lp) end)
     end
     return true
 end
 
 local function tryBlindHop()
-    pushLog("api exhausted — asking roblox for a server",
-        Color3.fromRGB(255, 200, 120))
-
-    -- Rejoin the same place; Roblox matchmaking will assign a new server
-    -- most of the time, especially if we waited a moment first.
+    pushLog("api exhausted — asking roblox", Color3.fromRGB(255, 200, 120))
     task.wait(1)
-
-    local ok = pcall(function()
-        ts:Teleport(game.PlaceId, lp)
-    end)
-
+    local ok = pcall(function() ts:Teleport(game.PlaceId, lp) end)
     if not ok then
-        -- Last resort: TeleportAsync with no ServerInstanceId
-        pcall(function()
-            ts:TeleportAsync(game.PlaceId, { lp })
-        end)
+        pcall(function() ts:TeleportAsync(game.PlaceId, { lp }) end)
     end
     return ok
 end
@@ -229,11 +230,7 @@ end
 local function serverHop()
     if hopping then return end
     hopping = true
-
-    if not tryApiHop() then
-        tryBlindHop()
-    end
-
+    if not tryApiHop() then tryBlindHop() end
     task.delay(10, function() hopping = false end)
 end
 
@@ -242,24 +239,19 @@ _G.ServerBlacklist = {
     add = addToBlacklist,
     remove = function(id)
         id = tostring(id)
-        if blacklist[id] then
-            blacklist[id] = nil
-            saveBlacklist()
-        end
+        if blacklist[id] then blacklist[id] = nil; saveBlacklist() end
     end,
     clear = function()
-        blacklist = {}
-        saveBlacklist()
+        blacklist = {}; saveBlacklist()
         pushLog("blacklist cleared", Color3.fromRGB(255, 200, 120))
     end,
     list = function()
-        local t = {}
-        for id in pairs(blacklist) do table.insert(t, id) end
-        return t
+        local t = {}; for id in pairs(blacklist) do table.insert(t, id) end; return t
     end,
     has = isBlacklisted,
     log = pushLog,
     hop = serverHop,
+    gui = gui,
 }
 
 --// Keybinds
