@@ -7,9 +7,10 @@ local tweenService = game:GetService("TweenService")
 local teleportService = game:GetService("TeleportService")
 local localPlayer = players.LocalPlayer
 
--- ============ GLOBALS (must be declared before any function uses them) ============
+-- ============ FORWARD REFS (must exist before any function uses them) ============
 local U = {}
 local accentListeners = {}
+local chatLabelRef = nil   -- bound inside buildUI once the log label exists
 
 if _G.__hopper_loaded then
     local pg = localPlayer:FindFirstChild("PlayerGui")
@@ -60,10 +61,10 @@ local function sessionLog(prefix, speaker, text, color)
     ) then
         diskAppend(sessionFile, "[" .. os.date("%H:%M:%S") .. "] " .. line)
     end
-    if U and U.chatLabel then
+    if chatLabelRef then
         local out = {}
         for _, l in ipairs(sessionLogs) do table.insert(out, l) end
-        U.chatLabel.Text = table.concat(out, "\n")
+        chatLabelRef.Text = table.concat(out, "\n")
     end
 end
 
@@ -1245,8 +1246,9 @@ local function buildUI()
     chatLabel.Text = ""
     chatLabel.ZIndex = 7
     U.chatLabel = chatLabel
+    chatLabelRef = chatLabel   -- forward ref so sessionLog can draw here
 
-    -- Redraw existing logs now that chatLabel exists
+    -- Redraw any buffered logs from before the label existed
     do
         local out = {}
         for _, l in ipairs(sessionLogs) do table.insert(out, l) end
@@ -1324,7 +1326,7 @@ local function buildUI()
 
     track(clearBtn.MouseButton1Click:Connect(function()
         sessionLogs = {}
-        if U.chatLabel then U.chatLabel.Text = "" end
+        if chatLabelRef then chatLabelRef.Text = "" end
     end))
 
     -- ===== SERVERS TAB =====
@@ -1351,7 +1353,7 @@ local function buildUI()
 
     section(sScroll, "scanner", 0)
 
-    local serverStatusCard = glassSurface(sScroll, 1)
+    local serverStatusCard = glasssSurface(sScroll, 1)
     serverStatusCard.Size = UDim2.new(1, 0, 0, 60)
 
     local serverListStatus = Instance.new("TextLabel", serverStatusCard)
