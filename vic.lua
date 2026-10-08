@@ -7,6 +7,10 @@ local tweenService = game:GetService("TweenService")
 local teleportService = game:GetService("TeleportService")
 local localPlayer = players.LocalPlayer
 
+-- ============ GLOBALS (must be declared before any function uses them) ============
+local U = {}
+local accentListeners = {}
+
 if _G.__hopper_loaded then
     local pg = localPlayer:FindFirstChild("PlayerGui")
     if pg then
@@ -56,7 +60,7 @@ local function sessionLog(prefix, speaker, text, color)
     ) then
         diskAppend(sessionFile, "[" .. os.date("%H:%M:%S") .. "] " .. line)
     end
-    if U.chatLabel then
+    if U and U.chatLabel then
         local out = {}
         for _, l in ipairs(sessionLogs) do table.insert(out, l) end
         U.chatLabel.Text = table.concat(out, "\n")
@@ -127,9 +131,6 @@ local scaleVelocity = 0
 local currentThemeIdx = persistConfig.themeIdx or 1
 local hopping = false
 
-local U = {}
-local accentListeners = {}
-
 local function track(c) table.insert(connections, c) return c end
 local function clamp(n, a, b) return math.max(a, math.min(b, n)) end
 
@@ -185,7 +186,7 @@ local C = {
     red      = Color3.fromRGB(240, 130, 140),
 }
 
--- Theme list — rainbow is a normal entry, just flagged so the loop knows to animate it
+-- Theme list — rainbow is a normal entry
 local themes = {
     {name="midnight", c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255)},
     {name="emerald",  c1=Color3.fromRGB(36,100,90),  c2=Color3.fromRGB(18,40,42),  c3=Color3.fromRGB(45,80,75),   accent=Color3.fromRGB(105,200,155), accentHi=Color3.fromRGB(140,225,180)},
@@ -396,7 +397,6 @@ local function glassButton(parent, height, order)
     return b
 end
 
--- Apply a theme. Handles both solid themes and rainbow (which just primes the loop).
 local function applyTheme(idx, save)
     if unloaded then return end
     currentThemeIdx = idx
@@ -404,8 +404,6 @@ local function applyTheme(idx, save)
     if save then saveConfigToDisk() end
     local t = themes[idx]
 
-    -- For solid themes: tween bg + orbs + accents
-    -- For rainbow: let the rainbow driver take over on next frame (no need to pre-set)
     if not t.rainbow then
         task.spawn(function()
             local prev = themes[(idx - 2) % #themes + 1]
@@ -444,15 +442,14 @@ local function applyTheme(idx, save)
     if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
 end
 
--- Single rainbow loop. Only does work when current theme is rainbow.
+-- Rainbow loop
 task.spawn(function()
     local hue = 0
     while not unloaded do
         local dt = runService.RenderStepped:Wait()
         if themes[currentThemeIdx].rainbow then
-            hue = (hue + dt * 0.08) % 1  -- ~12s per cycle, smooth
+            hue = (hue + dt * 0.08) % 1
 
-            -- bg gradient: three keypoints, same hue family (very slight shift)
             if U.bgGrad then
                 local c1 = Color3.fromHSV(hue, 0.55, 0.55)
                 local c2 = Color3.fromHSV(hue, 0.55, 0.22)
@@ -1249,6 +1246,13 @@ local function buildUI()
     chatLabel.ZIndex = 7
     U.chatLabel = chatLabel
 
+    -- Redraw existing logs now that chatLabel exists
+    do
+        local out = {}
+        for _, l in ipairs(sessionLogs) do table.insert(out, l) end
+        if #out > 0 then chatLabel.Text = table.concat(out, "\n") end
+    end
+
     local inputBar = glassSurface(logsPage)
     inputBar.Size = UDim2.new(1, -28, 0, 70)
     inputBar.Position = UDim2.new(0, 14, 1, -84)
@@ -1456,7 +1460,6 @@ local function buildUI()
     for i, t in ipairs(themes) do
         local sw = Instance.new("TextButton", swatchRow)
         if t.rainbow then
-            -- rainbow swatch: multi-stop gradient
             sw.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
             local swRainbow = Instance.new("UIGradient", sw)
             swRainbow.Color = ColorSequence.new({
@@ -1971,7 +1974,7 @@ end
 
 buildUI()
 
--- Prime the initial theme. If it's not rainbow, snap accents to saved theme.
+-- Prime initial theme
 local t0 = themes[currentThemeIdx]
 if not t0.rainbow then
     for _, listener in ipairs(accentListeners) do
