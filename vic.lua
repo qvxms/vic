@@ -3,142 +3,171 @@ local ps = game:GetService("Players")
 local hs = game:GetService("HttpService")
 local lp = ps.LocalPlayer
 
--- Use executor request function if available to prevent HttpService blocks
 local requestFunc = (syn and syn.request) or http_request or request
 
--- Blacklist system
 local BLACKLIST_FILE = "server_blacklist.json"
 
--- Load blacklist from file
+-- In-memory blacklist (always works)
+local blacklist = {}
+
+-- Load persisted blacklist
 local function loadBlacklist()
-    if writefile and readfile and isfile then
-        if isfile(BLACKLIST_FILE) then
-            local success, data = pcall(function()
-                return hs:JSONDecode(readfile(BLACKLIST_FILE))
-            end)
-            if success and type(data) == "table" then
-                return data
+    if readfile and isfile and isfile(BLACKLIST_FILE) then
+        local ok, data = pcall(function()
+            return hs:JSONDecode(readfile(BLACKLIST_FILE))
+        end)
+        if ok and type(data) == "table" then
+            for _, id in ipairs(data) do
+                blacklist[tostring(id)] = true
             end
         end
     end
-    return {}
 end
 
--- Save blacklist to file
-local function saveBlacklist(blacklist)
+local function saveBlacklist()
     if writefile then
+        local list = {}
+        for id, _ in pairs(blacklist) do
+            table.insert(list, id)
+        end
         pcall(function()
-            writefile(BLACKLIST_FILE, hs:JSONEncode(blacklist))
+            writefile(BLACKLIST_FILE, hs:JSONEncode(list))
         end)
     end
 end
 
--- Global blacklist table
-local blacklist = loadBlacklist()
+loadBlacklist()
 
--- Check if a server is blacklisted
+-- Always blacklist the CURRENT server immediately on load
+if game.JobId and game.JobId ~= "" then
+    blacklist[tostring(game.JobId)] = true
+    saveBlacklist()
+    print("[Blacklist] Current server blacklisted: " .. game.JobId)
+end
+
 local function isBlacklisted(serverId)
-    for _, id in ipairs(blacklist) do
-        if tostring(id) == tostring(serverId) then
-            return true
-        end
-    end
-    return false
+    return blacklist[tostring(serverId)] == true
 end
 
--- Add a server to blacklist
 local function addToBlacklist(serverId)
-    if not isBlacklisted(serverId) then
-        table.insert(blacklist, tostring(serverId))
-        saveBlacklist(blacklist)
-        print("[Blacklist] Added server: " .. tostring(serverId))
+    if serverId and serverId ~= "" and not isBlacklisted(serverId) then
+        blacklist[tostring(serverId)] = true
+        saveBlacklist()
+        print("[Blacklist] Added: " .. tostring(serverId))
     end
 end
 
--- Remove a server from blacklist
 local function removeFromBlacklist(serverId)
-    for i, id in ipairs(blacklist) do
-        if tostring(id) == tostring(serverId) then
-            table.remove(blacklist, i)
-            saveBlacklist(blacklist)
-            print("[Blacklist] Removed server: " .. tostring(serverId))
-            return true
-        end
+    serverId = tostring(serverId)
+    if blacklist[serverId] then
+        blacklist[serverId] = nil
+        saveBlacklist()
+        print("[Blacklist] Removed: " .. serverId)
+        return true
     end
     return false
 end
 
--- Clear the blacklist
 local function clearBlacklist()
     blacklist = {}
-    saveBlacklist(blacklist)
-    print("[Blacklist] Cleared all servers")
+    saveBlacklist()
+    print("[Blacklist] Cleared")
 end
 
--- Server hop function with blacklist filtering
+local function fetchServers(cursor)
+    local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100"
+    if cursor then
+        url = url .. "&cursor=" .. cursor
+    end
+
+    local body
+    if requestFunc then
+        local ok, res = pcall(function()
+            return requestFunc({ Url = url, Method = "GET" })
+        end)
+        if ok and res and res.Body then
+            body = res.Body
+        end
+    end
+
+    if not body then
+        local ok, res = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if ok then body = res end
+    end
+
+    if not body then return nil end
+
+    local ok, decoded = pcall(function()
+        return hs:JSONDecode(body)
+    end)
+    if ok then return decoded end
+    return nil
+end
+
 local function serverHop()
-    print("Finding fresh server via request...")
+    print("[ServerHop] Searching for a fresh server...")
 
-    local success, result = pcall(function()
-        local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100"
-        
-        local response
-        if requestFunc then
-            response = requestFunc({
-                Url = url,
-                Method = "GET"
-            })
-        else
-            response = {
-                Body = game:HttpGet(url)
-            }
-        end
+    -- Collect servers across multiple pages to find a non-blacklisted one
+    local cursor = nil
+    local chosen = nil
 
-        local data = hs:JSONDecode(response.Body)
-        
-        if not data or not data.data then
-            warn("[ServerHop] Failed to fetch server list")
-            return
-        end
+    for page = 1, 5 do
+        local data = fetchServers(cursor)
+        if not data or not data.data then break end
 
-        -- Filter out blacklisted and full servers
-        local availableServers = {}
         for _, server in ipairs(data.data) do
-            if server.id ~= game.JobId 
-                and server.playing < server.maxPlayers 
-                and not isBlacklisted(server.id) then
-                table.insert(availableServers, server)
+            local id = tostring(server.id)
+            if id ~= tostring(game.JobId)
+                and server.playing < server.maxPlayers
+                and not isBlacklisted(id) then
+                chosen = server
+                break
             end
         end
 
-        if #availableServers == 0 then
-            warn("[ServerHop] No available servers found (all blacklisted or full)")
-            return
-        end
+        if chosen then break end
+        cursor = data.nextPageCursor
+        if not cursor then break end
+    end
 
-        -- Pick a random server from available ones
-        local chosen = availableServers[math.random(1, #availableServers)]
-        print("[ServerHop] Hopping to server: " .. chosen.id .. " (" .. chosen.playing .. "/" .. chosen.maxPlayers .. ")")
-        
-        -- Blacklist the current server before hopping (so you don't return to it)
+    if not chosen then
+        warn("[ServerHop] No fresh servers available. All are blacklisted or full.")
+        return
+    end
+
+    print("[ServerHop] Hopping to " .. chosen.id .. " (" .. chosen.playing .. "/" .. chosen.maxPlayers .. ")")
+
+    -- Blacklist current before teleporting
+    if game.JobId and game.JobId ~= "" then
         addToBlacklist(game.JobId)
-        
-        ts:TeleportToPlaceInstance(game.PlaceId, chosen.id, lp)
+    end
+
+    -- Use Teleport with teleport options (more reliable than TeleportToPlaceInstance)
+    local ok = pcall(function()
+        local opts = Instance.new("TeleportOptions")
+        opts.ServerInstanceId = chosen.id
+        ts:TeleportAsync(game.PlaceId, { lp }, opts)
     end)
-    
-    if not success then
-        warn("[ServerHop] Error: " .. tostring(result))
+
+    if not ok then
+        pcall(function()
+            ts:TeleportToPlaceInstance(game.PlaceId, chosen.id, lp)
+        end)
     end
 end
 
--- Expose blacklist functions globally for manual control
 _G.ServerBlacklist = {
     add = addToBlacklist,
     remove = removeFromBlacklist,
     clear = clearBlacklist,
-    list = function() return blacklist end,
-    has = isBlacklisted
+    list = function()
+        local t = {}
+        for id, _ in pairs(blacklist) do table.insert(t, id) end
+        return t
+    end,
+    has = isBlacklisted,
 }
 
--- Run server hop
 serverHop()
