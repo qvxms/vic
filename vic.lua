@@ -1,3 +1,10 @@
+--// Auto-execute server hopper
+-- Place in your executor's autoexec folder.
+
+--// Prevent double-run on same session
+if _G.__ServerHopperRan then return end
+_G.__ServerHopperRan = true
+
 --// Services
 local ts = game:GetService("TeleportService")
 local ps = game:GetService("Players")
@@ -10,8 +17,10 @@ local requestFunc = (syn and syn.request) or http_request or request
 --// Config
 local BLACKLIST_FILE = "server_blacklist.json"
 local MAX_PAGES = 8
-local MIN_PLAYERS = 1        -- skip empty servers
-local MAX_PLAYER_RATIO = 0.9 -- skip near-full servers
+local MIN_PLAYERS = 1
+local MAX_PLAYER_RATIO = 0.9
+local AUTO_HOP_DELAY = 3        -- seconds to wait after joining before hopping
+local HOP_ON_JOIN = true        -- set to false to only hop via keybind
 
 --// In-memory blacklist
 local blacklist = {}
@@ -41,14 +50,14 @@ end
 
 loadBlacklist()
 
--- Capture current JobId (may be empty on some executors)
+-- Capture current JobId
 local currentJobId = tostring(game.JobId or "")
 if currentJobId ~= "" then
     blacklist[currentJobId] = true
     saveBlacklist()
 end
 
---// GUI (no background, just floating text)
+--// GUI
 local gui = Instance.new("ScreenGui")
 gui.Name = "ServerHopperLogs"
 gui.ResetOnSpawn = false
@@ -156,8 +165,13 @@ local function fetchPage(cursor)
     return nil
 end
 
---// Hop logic
+--// Hop
+local hopping = false
+
 local function serverHop()
+    if hopping then return end
+    hopping = true
+
     pushLog("scanning for open servers...", Color3.fromRGB(180, 200, 255))
 
     local candidates = {}
@@ -189,7 +203,8 @@ local function serverHop()
 
     if #candidates == 0 then
         pushLog("no fresh servers found", Color3.fromRGB(255, 120, 120))
-        pushLog("try again in a minute", Color3.fromRGB(180, 180, 180))
+        pushLog("press F2 to retry manually", Color3.fromRGB(180, 180, 180))
+        hopping = false
         return
     end
 
@@ -216,6 +231,9 @@ local function serverHop()
             ts:TeleportToPlaceInstance(game.PlaceId, chosen.id, lp)
         end)
     end
+
+    -- Reset flag in case teleport fails silently
+    task.delay(8, function() hopping = false end)
 end
 
 --// Public API
@@ -241,11 +259,39 @@ _G.ServerBlacklist = {
     end,
     has = isBlacklisted,
     log = pushLog,
+    hop = serverHop,
 }
 
+--// Keybinds (toggle GUI with RightShift, manual hop with F2)
+local UIS = game:GetService("UserInputService")
+
+local guiVisible = true
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        guiVisible = not guiVisible
+        gui.Enabled = guiVisible
+    elseif input.KeyCode == Enum.KeyCode.F2 then
+        if not hopping then
+            pushLog("manual hop triggered", Color3.fromRGB(200, 200, 255))
+            serverHop()
+        end
+    end
+end)
+
+--// Startup log
 pushLog("loaded " .. tostring(#_G.ServerBlacklist.list()) .. " blacklisted servers",
     Color3.fromRGB(180, 180, 180))
 pushLog("current job: " .. (currentJobId ~= "" and shortId(currentJobId) or "unknown"),
     currentJobId ~= "" and Color3.fromRGB(180, 180, 180) or Color3.fromRGB(255, 120, 120))
+pushLog("rightshift = toggle • F2 = hop", Color3.fromRGB(160, 160, 200))
 
-serverHop()
+--// Auto hop after loading
+if HOP_ON_JOIN then
+    task.spawn(function()
+        task.wait(AUTO_HOP_DELAY)
+        if not hopping then
+            serverHop()
+        end
+    end)
+end
