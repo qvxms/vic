@@ -38,6 +38,11 @@ local config = {
 }
 
 local blacklist = {}
+local sessionVisited = {}
+local expectedJobId = nil
+local hopAttempts = 0
+local MAX_AUTO_RETRIES = 4
+
 local connections = {}
 local unloaded = false
 local currentScale = 1
@@ -45,11 +50,9 @@ local targetScale = 1
 local scaleVelocity = 0
 local currentThemeIdx = 1
 local hopping = false
-local currentJobId = tostring(game.JobId or "")
 local lastHopTime = 0
 
 local logs = {}
-local logLines = {}
 local MAX_LOGS = 60
 
 local U = {}
@@ -77,10 +80,38 @@ local function saveBlacklist()
 end
 
 loadBlacklist()
-if currentJobId ~= "" then
-    blacklist[currentJobId] = true
+
+-- Try to grab a reliable current-server identifier
+local function getCurrentServerId()
+    -- 1. game.JobId (works on most desktop executors)
+    local jid = game.JobId
+    if jid and jid ~= "" then return tostring(jid) end
+
+    -- 2. Read from TeleportService's internal (works when JobId is hidden)
+    local ok, info = pcall(function() return teleportService:GetLocalPlayerTeleportData() end)
+    if ok and type(info) == "table" and info.JobId then return tostring(info.JobId) end
+
+    -- 3. Give up
+    return nil
+end
+
+local currentServerId = getCurrentServerId()
+if currentServerId then
+    blacklist[currentServerId] = true
+    sessionVisited[currentServerId] = true
     saveBlacklist()
 end
+
+-- Detect "I just landed back on the same server" after a hop
+task.spawn(function()
+    if expectedJobId and currentServerId and currentServerId == expectedJobId then
+        expectedJobId = nil
+        hopAttempts = 0
+    elseif expectedJobId and currentServerId and currentServerId ~= expectedJobId then
+        expectedJobId = nil
+        hopAttempts = 0
+    end
+end)
 
 local function logLine(prefix, speaker, text, color)
     color = color or Color3.fromRGB(242, 244, 250)
@@ -105,7 +136,7 @@ local function shortId(id)
     return #id > 10 and id:sub(1, 10) or id
 end
 
--- ============ UI FRAMEWORK (copied from grycan) ============
+-- ============ UI FRAMEWORK ============
 
 local C = {
     text     = Color3.fromRGB(242, 244, 250),
@@ -401,6 +432,8 @@ local function scanServers()
     local candidates = {}
     local cursor = nil
     local totalScanned = 0
+    local skippedBlacklist = 0
+    local skippedFull = 0
 
     for page = 1, config.maxPages do
         local data = fetchPage(cursor)
@@ -409,11 +442,19 @@ local function scanServers()
         for _, s in ipairs(data.data) do
             totalScanned = totalScanned + 1
             local id = tostring(s.id)
-            local ratio = s.playing / math.max(s.maxPlayers, 1)
-            if id ~= currentJobId
-                and not blacklist[id]
-                and s.playing >= config.minPlayers
-                and ratio < config.maxPlayerRatio then
+
+            -- Hard skip: current server, any blacklisted, any visited this session
+            if id == currentServerId or blacklist[id] or sessionVisited[id] then
+                skippedBlacklist = skippedBlacklist + 1
+            elseif s.playing >= s.maxPlayers then
+                -- Strictly skip FULL servers
+                skippedFull = skippedFull + 1
+            elseif s.playing < config.minPlayers then
+                -- too empty
+            elseif s.playing >= (s.maxPlayers - 1) and config.maxPlayerRatio < 1.0 then
+                -- reserve at least 1 slot
+                skippedFull = skippedFull + 1
+            else
                 table.insert(candidates, s)
             end
         end
@@ -423,6 +464,7 @@ local function scanServers()
     end
 
     log("scanned " .. totalScanned .. " servers")
+    log("skipped " .. skippedBlacklist .. " blacklisted, " .. skippedFull .. " full")
     if #candidates > 0 then
         logGood("found " .. #candidates .. " candidates")
     else
@@ -440,47 +482,61 @@ local function doHop()
         local candidates = scanServers()
 
         if #candidates == 0 then
-            logWarn("api exhausted — asking roblox")
-            task.wait(1)
-            if currentJobId ~= "" then
-                blacklist[currentJobId] = true
-                saveBlacklist()
+            hopAttempts = hopAttempts + 1
+            if hopAttempts > MAX_AUTO_RETRIES then
+                logBad("giving up after " .. MAX_AUTO_RETRIES .. " failed attempts")
+                logWarn("roblox's public server API isn't returning fresh servers")
+                logWarn("try again in 1-2 minutes")
+                hopping = false
+                setStatus("ok", "ready")
+                return
             end
-            lastHopTime = tick()
-            local ok = pcall(function() teleportService:Teleport(game.PlaceId, localPlayer) end)
-            if not ok then
-                pcall(function() teleportService:TeleportAsync(game.PlaceId, {localPlayer}) end)
+
+            logWarn("no candidates — retry " .. hopAttempts .. "/" .. MAX_AUTO_RETRIES .. " in 3s")
+            task.wait(3)
+
+            candidates = scanServers()
+            if #candidates == 0 then
+                logBad("still no fresh servers")
+                hopping = false
+                setStatus("ok", "ready")
+                return
             end
-            hopping = false
-            setStatus("ok")
-            return
         end
 
-        local chosen = candidates[math.random(1, #candidates)]
+        -- Prefer the server with the most players, pick randomly among top third
+        table.sort(candidates, function(a, b) return a.playing > b.playing end)
+        local poolSize = math.max(1, math.floor(#candidates / 3))
+        local chosen = candidates[math.random(1, poolSize)]
+
         logGood("selected " .. shortId(chosen.id) .. " (" .. chosen.playing .. "/" .. chosen.maxPlayers .. ")")
 
-        if currentJobId ~= "" then
-            blacklist[currentJobId] = true
+        if currentServerId then
+            blacklist[currentServerId] = true
+            sessionVisited[currentServerId] = true
             saveBlacklist()
         end
 
+        expectedJobId = tostring(chosen.id)
         lastHopTime = tick()
-        task.wait(0.6)
+        task.wait(0.7)
 
+        -- Attempt 1: TeleportAsync with proper options
         local ok = pcall(function()
             local opts = Instance.new("TeleportOptions")
-            opts.ServerInstanceId = chosen.id
+            opts.ServerInstanceId = tostring(chosen.id)
+            opts.ShouldReserveServer = false
             teleportService:TeleportAsync(game.PlaceId, {localPlayer}, opts)
         end)
 
         if not ok then
-            logWarn("teleportAsync failed, retrying")
+            logWarn("teleportAsync failed — falling back to TeleportToPlaceInstance")
             pcall(function()
-                teleportService:TeleportToPlaceInstance(game.PlaceId, chosen.id, localPlayer)
+                teleportService:TeleportToPlaceInstance(game.PlaceId, tostring(chosen.id), localPlayer)
             end)
         end
 
-        task.delay(8, function() hopping = false end)
+        task.delay(12, function() hopping = false end)
     end)
 end
 
@@ -1243,7 +1299,7 @@ local function buildUI()
     statsSubLabel.TextSize = 10
     statsSubLabel.TextColor3 = C.textMid
     statsSubLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statsSubLabel.Text = "current job: " .. (currentJobId ~= "" and shortId(currentJobId) or "unknown")
+    statsSubLabel.Text = "current job: " .. (currentServerId and shortId(currentServerId) or "unknown")
     statsSubLabel.ZIndex = 6
     U.statsSubLabel = statsSubLabel
 
@@ -1291,6 +1347,7 @@ local function buildUI()
 
     actionBtn("clear all", 0.5, Color3.fromRGB(200, 70, 85), 1, function()
         blacklist = {}
+        sessionVisited = {}
         saveBlacklist()
         logWarn("blacklist cleared")
         if U.refreshBlacklist then U.refreshBlacklist() end
@@ -1330,7 +1387,7 @@ local function buildUI()
             U.statsCountLabel.Text = count .. " blacklisted"
         end
         if U.statsSubLabel then
-            U.statsSubLabel.Text = "current job: " .. (currentJobId ~= "" and shortId(currentJobId) or "unknown")
+            U.statsSubLabel.Text = "current job: " .. (currentServerId and shortId(currentServerId) or "unknown")
         end
 
         if count == 0 then
@@ -1412,6 +1469,7 @@ local function buildUI()
             track(delBtn.MouseLeave:Connect(function() tw(delBtn, {BackgroundTransparency = 0.2}, 0.22) end))
             track(delBtn.MouseButton1Click:Connect(function()
                 blacklist[id] = nil
+                sessionVisited[id] = nil
                 saveBlacklist()
                 log("removed " .. shortId(id), C.yellow)
                 U.refreshBlacklist()
@@ -1587,8 +1645,13 @@ end
 _G.__hopper_unload = unload
 
 -- Boot
-log("loaded " .. tostring(#(function() local t={} for id in pairs(blacklist) do table.insert(t,id) end return t end)()) .. " blacklisted servers")
-log("current job: " .. (currentJobId ~= "" and shortId(currentJobId) or "unknown"), currentJobId ~= "" and C.textMid or C.red)
+do
+    local blCount = 0
+    for _ in pairs(blacklist) do blCount = blCount + 1 end
+    log("loaded " .. blCount .. " blacklisted servers")
+end
+log("current job: " .. (currentServerId and shortId(currentServerId) or "unknown"),
+    currentServerId and C.textMid or C.red)
 log("rightshift toggle · F2 hop · manual button on logs tab")
 setStatus("ok", "ready")
 
