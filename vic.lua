@@ -1,4 +1,4 @@
--- Server Hopper v0.2 · liquid glass
+-- Server Hopper v0.2 · liquid glass · vicious bee hunter
 local Players         = game:GetService("Players")
 local HttpService     = game:GetService("HttpService")
 local UIS             = game:GetService("UserInputService")
@@ -12,11 +12,11 @@ if _G.__hopper_unload then pcall(_G.__hopper_unload) end
 
 local request = (syn and syn.request) or (http and http.request) or http_request or request
 
-local VERSION  = "v0.2 beta"
+local VERSION  = "v0.3 beta"
 local ICON     = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
 local FILE_BL  = "hopper_blacklist.json"
 local FILE_CFG = "hopper_config.json"
-local BL_TTL   = 6 * 3600        -- blacklist entries expire (servers are short-lived)
+local BL_TTL   = 6 * 3600
 local MAX_PAGES, WANT, MAX_RETRIES, MAX_ROWS = 15, 40, 4, 80
 
 local rgb, CSK, NSK = Color3.fromRGB, ColorSequenceKeypoint.new, NumberSequenceKeypoint.new
@@ -39,7 +39,7 @@ local function debounce(fn, d)
     end
 end
 
-local U = {}  -- ui refs
+local U = {}
 
 -- ============ DISK ============
 local canFS = writefile and readfile and isfile
@@ -76,7 +76,7 @@ local function logWarn(t) log(t, C.yellow, true) end
 local function logBad(t)  log(t, C.red, true) end
 
 -- ============ CONFIG ============
-local cfg = { themeIdx = 1, scale = 1, preferLessFull = true, skipEmpty = true, hopOnJoin = false }
+local cfg = { themeIdx = 1, scale = 1, preferLessFull = true, skipEmpty = true, hopOnJoin = false, viciousBeeMode = false }
 do
     local d = readJSON(FILE_CFG)
     if type(d) == "table" then
@@ -94,7 +94,7 @@ do
     if type(d) == "table" then
         for k, v in pairs(d) do
             local id, t
-            if type(k) == "number" then id, t = tostring(v), now   -- legacy array format
+            if type(k) == "number" then id, t = tostring(v), now
             else id, t = k, tonumber(v) or now end
             if now - t < BL_TTL then blacklist[id] = t end
         end
@@ -140,7 +140,7 @@ end
 local pal = themes[cfg.themeIdx].pal
 local rainbowOn = themes[cfg.themeIdx].rainbow or false
 local hue, transitioning = 0, false
-local registry = {}   -- accent-bound objects: {obj, prop, kind}
+local registry = {}
 local function reg(obj, prop, kind) registry[#registry + 1] = { obj, prop, kind } end
 
 local function paint(p)
@@ -188,7 +188,6 @@ local function hover(o, on, off, s, sOn, sOff)
     track(o.MouseLeave:Connect(function() tw(o, off, .22) if s then tw(s, sOff, .22) end end))
 end
 
--- shared glass sequences (immutable, safe to reuse)
 local GL_C = ColorSequence.new({ CSK(0, WHITE), CSK(.6, rgb(230,232,240)), CSK(1, rgb(200,205,218)) })
 local GL_T = NumberSequence.new(0.86, 0.94)
 local ST_C = ColorSequence.new({ CSK(0, WHITE), CSK(.5, rgb(200,210,230)), CSK(1, rgb(140,148,168)) })
@@ -248,11 +247,124 @@ end
 
 local function setStatus(state, txt)
     if not U.statusDot then return end
-    local col = (state == "ok" and C.green) or (state == "loading" and C.yellow) or C.red
+    local col = (state == "ok" and C.green) or (state == "loading" and C.yellow) or (state == "bee" and C.green) or C.red
     U.statusText.Text = txt or ((state == "ok" and "ready") or (state == "loading" and "scanning") or "idle")
     tw(U.statusDot, { BackgroundColor3 = col }, .36)
     tw(U.statusRing, { Color = col }, .36)
     U.pillDot.BackgroundColor3 = col
+end
+
+-- ============ VICIOUS BEE DETECTION ============
+-- Scans workspace (direct + common containers) and PlayerGui for anything named/messaged "vicious".
+-- Returns (true, source) if found, (false, nil) otherwise.
+
+local BEE_CONTAINERS = { "Bees", "NPCs", "Mobs", "Enemies", "Entities", "Spawns", "Hostiles", "Bosses" }
+
+local function detectViciousBee()
+    if unloaded then return false end
+
+    -- 1) direct workspace children (name match, case-insensitive)
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local n = obj.Name:lower()
+        if n:find("vicious", 1, true) then
+            return true, "workspace." .. obj.Name
+        end
+    end
+
+    -- 2) common containers, one level deep
+    for _, cName in ipairs(BEE_CONTAINERS) do
+        local c = workspace:FindFirstChild(cName)
+        if c then
+            for _, obj in ipairs(c:GetChildren()) do
+                if obj.Name:lower():find("vicious", 1, true) then
+                    return true, cName .. "." .. obj.Name
+                end
+            end
+        end
+    end
+
+    -- 3) PlayerGui text (boss bars, spawn notifications)
+    local pg = lp:FindFirstChild("PlayerGui")
+    if pg then
+        for _, gui in ipairs(pg:GetDescendants()) do
+            if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Visible then
+                local t = gui.Text
+                if t and t ~= "" and t:lower():find("vicious", 1, true) then
+                    return true, "gui:" .. gui.Name
+                end
+            end
+        end
+    end
+
+    -- 4) CoreGui (if accessible)
+    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok and cg then
+        for _, gui in ipairs(cg:GetDescendants()) do
+            if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Visible then
+                local t = gui.Text
+                if t and t ~= "" and t:lower():find("vicious", 1, true) then
+                    return true, "coregui:" .. gui.Name
+                end
+            end
+        end
+    end
+
+    return false, nil
+end
+
+local beeFound, hunting = false, false
+
+local function flashWin(times, color)
+    if not U.win then return end
+    task.spawn(function()
+        local original = U.win.BackgroundColor3
+        for i = 1, times do
+            if unloaded then return end
+            tw(U.win, { BackgroundColor3 = color }, .16)
+            task.wait(.16)
+            if unloaded then return end
+            tw(U.win, { BackgroundColor3 = original }, .16)
+            task.wait(.16)
+        end
+    end)
+end
+
+local function huntViciousBee()
+    if unloaded or beeFound then return end
+    if not cfg.viciousBeeMode then return end
+    if hunting then return end
+    hunting = true
+
+    logInfo("checking for vicious bee in this server...")
+    setStatus("loading", "checking")
+
+    -- give the game time to load / spawn things, check once per second for 8s
+    local found, src = false, nil
+    for i = 1, 8 do
+        task.wait(1)
+        if unloaded or not cfg.viciousBeeMode then hunting = false return end
+        found, src = detectViciousBee()
+        if found then break end
+    end
+
+    if found then
+        beeFound = true
+        logGood("═══════════════════════════")
+        logGood("VICIOUS BEE FOUND!")
+        logGood("source: " .. tostring(src))
+        logGood("═══════════════════════════")
+        setStatus("bee", "bee found")
+        flashWin(8, C.green)
+        hunting = false
+        return
+    end
+
+    logWarn("no vicious bee — hopping to next server")
+    hunting = false
+    if not unloaded and cfg.viciousBeeMode and not hopping then
+        task.wait(0.4)
+        doHop()
+    end
 end
 
 -- ============ NETWORK + HOP LOGIC ============
@@ -273,7 +385,7 @@ local function fetchPage(cursor)
         if unloaded then return nil end
         local body, status = httpGet(url)
         if status == 429 then
-            task.wait(1.5 * attempt)           -- rate limited: back off
+            task.wait(1.5 * attempt)
         elseif body then
             local ok, d = pcall(HttpService.JSONDecode, HttpService, body)
             if ok and type(d) == "table" and type(d.data) == "table" then return d end
@@ -292,7 +404,6 @@ local function usable(s)
     return s.playing / s.maxPlayers <= (cfg.preferLessFull and 0.9 or 1)
 end
 
--- single scanner. stopAt = stop early once that many usable servers were found
 local function scan(onPage, stopAt)
     local all, good, cursor = {}, 0, nil
     for page = 1, MAX_PAGES do
@@ -385,11 +496,10 @@ local function doHop(forcedId)
             release(token)
             return
         end
-        task.delay(15, function() release(token) end)   -- watchdog if teleport silently stalls
+        task.delay(15, function() release(token) end)
     end)
 end
 
--- teleport rejected (full / dead server): ban it and try another
 track(TeleportService.TeleportInitFailed:Connect(function(plr, result, msg)
     if plr ~= lp then return end
     logWarn("teleport failed: " .. tostring(result))
@@ -435,7 +545,6 @@ local function makeServerRow(frame, s, order)
         TextXAlignment = Enum.TextXAlignment.Right,
         TextColor3 = isFull and C.yellow or (isCur and C.green or C.mid),
         Text = s.playing .. "/" .. s.maxPlayers .. ((s.ping and s.ping > 0) and ("  " .. s.ping .. "ms") or "") })
-    -- rows are destroyed on re-render so their connections die with them (no track needed)
     row.MouseEnter:Connect(function() tw(row, { BackgroundTransparency = isCur and .7 or .82 }, .16) end)
     row.MouseLeave:Connect(function() tw(row, { BackgroundTransparency = isCur and .78 or .9 }, .2) end)
     row.MouseButton1Click:Connect(function()
@@ -459,7 +568,7 @@ function U.renderServerList(list)
     for i = 1, math.min(#rows, MAX_ROWS) do
         if token ~= renderToken or unloaded then return end
         makeServerRow(frame, rows[i], i)
-        if i % 20 == 0 then task.wait() end     -- keep frames smooth while building
+        if i % 20 == 0 then task.wait() end
     end
     if #rows > MAX_ROWS and token == renderToken then
         local f = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = MAX_ROWS + 1 }, frame)
@@ -486,7 +595,7 @@ function U.refreshServerScan(force)
         logGood("scan complete: " .. #list .. " servers")
         U.renderServerList(list)
         U.serverStatus.Text = #list .. " servers · " .. (currentId and shortId(currentId) or "?")
-        if not hopping then setStatus("ok", "ready") end
+        if not hopping and not hunting then setStatus("ok", "ready") end
     end)
 end
 
@@ -496,7 +605,6 @@ local gui = make("ScreenGui", { Name = "hopper", ResetOnSpawn = false, IgnoreGui
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, nil)
 gui.Parent = lp:WaitForChild("PlayerGui")
 
--- theme switching: one NumberValue drives a single lerp (replaces dozens of manual tween loops)
 local alpha = Instance.new("NumberValue")
 local fromPal, toPal, themeTween
 track(alpha:GetPropertyChangedSignal("Value"):Connect(function()
@@ -527,11 +635,11 @@ local function build()
 
     local win = make("Frame", { BackgroundColor3 = rgb(14, 14, 20), Size = UDim2.fromScale(1, 1), Active = true,
         ClipsDescendants = true }, container)
+    U.win = win
     corner(win, 16)
     local wst = make("UIStroke", { Color = WHITE, Thickness = 1 }, win)
     grad(wst, ColorSequence.new(WHITE, rgb(140, 148, 168)), NumberSequence.new(0.5, 0.88))
 
-    -- background layer
     local bg = make("Frame", { BackgroundColor3 = rgb(14, 14, 20), Size = UDim2.fromScale(1, 1), ZIndex = 0,
         ClipsDescendants = true }, win)
     corner(bg, 16)
@@ -541,7 +649,6 @@ local function build()
     corner(make("Frame", { BackgroundColor3 = rgb(10, 10, 14), BackgroundTransparency = .6,
         Size = UDim2.fromScale(1, 1), ZIndex = 1 }, bg), 16)
 
-    -- orbs: native looping tweens (no per-orb coroutine, zero Lua cost per frame)
     local function orb(color, size, p0, p1, dur, trans)
         local o = make("Frame", { BackgroundColor3 = color, BackgroundTransparency = trans, Size = UDim2.fromOffset(size, size),
             Position = p0, ZIndex = 2 }, bg)
@@ -554,7 +661,6 @@ local function build()
     U.orb2 = orb(pal.c3, 280, UDim2.new(.7, 0, .5, 0),   UDim2.new(.15, 0, .95, 0), 20, .78)
     U.orb3 = orb(pal.c2, 240, UDim2.new(.3, 0, .7, 0),   UDim2.new(.75, 0, -.05, 0), 24, .82)
 
-    -- ===== header =====
     local header = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, HEADER_H) }, win)
     draggable(container, header)
 
@@ -583,7 +689,6 @@ local function build()
         { BackgroundColor3 = WHITE, BackgroundTransparency = .85, TextColor3 = C.mid })
     hover(btnMin, { BackgroundTransparency = .7, TextColor3 = C.text }, { BackgroundTransparency = .85, TextColor3 = C.mid })
 
-    -- ===== tabs =====
     local tabsBar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, TABS_H), Position = UDim2.fromOffset(0, HEADER_H) }, win)
     local content = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -HEADER_H - TABS_H),
         Position = UDim2.fromOffset(0, HEADER_H + TABS_H), ClipsDescendants = true }, win)
@@ -636,7 +741,6 @@ local function build()
         ScrollBarImageColor3 = WHITE, ScrollBarImageTransparency = .7 }, chatCard)
     U.logLabel = text(logScroll, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code,
         TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, LineHeight = 1.45, RichText = true, Text = "" })
-    -- autoscroll to newest line
     track(logScroll:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
         logScroll.CanvasPosition = Vector2.new(0, math.max(0, logScroll.AbsoluteCanvasSize.Y - logScroll.AbsoluteSize.Y))
     end))
@@ -749,7 +853,21 @@ local function build()
             tw(trackF, { BackgroundColor3 = state and C.green or rgb(64, 66, 78) }, .28)
             if onChange then onChange(state) end
         end))
+        return b
     end
+
+    section(tScroll, "vicious bee", n())
+    toggleRow("vicious bee hunter (auto-hop until found)", "viciousBeeMode", n())
+    local huntBtn = solidButton(tScroll, "start hunting now", pal.acc, {
+        Size = UDim2.new(1, 0, 0, 44), LayoutOrder = n()
+    }, true)
+    track(huntBtn.MouseButton1Click:Connect(function()
+        beeFound = false
+        cfg.viciousBeeMode = true
+        saveCfg()
+        logInfo("starting vicious bee hunt from current server")
+        huntViciousBee()
+    end))
 
     section(tScroll, "behavior", n())
     toggleRow("auto hop on join (needs autoexec)", "hopOnJoin", n())
@@ -876,7 +994,7 @@ build()
 paint(pal)
 U.refreshBlacklist()
 
--- ============ HEARTBEAT: log flush + rainbow (throttled, skipped while hidden) ============
+-- ============ HEARTBEAT: log flush + rainbow ============
 local acc = 0
 track(RunService.Heartbeat:Connect(function(dt)
     local visible = U.container and U.container.Visible
@@ -907,6 +1025,12 @@ track(UIS.InputBegan:Connect(function(input, gpe)
     elseif k == Enum.KeyCode.F3 then
         logInfo("hotkey scan servers (F3)")
         U.refreshServerScan(true)
+    elseif k == Enum.KeyCode.F4 then
+        logInfo("hotkey hunt vicious bee (F4)")
+        beeFound = false
+        cfg.viciousBeeMode = true
+        saveCfg()
+        huntViciousBee()
     end
 end))
 
@@ -932,10 +1056,14 @@ do
     log("loaded " .. n .. " blacklisted servers")
 end
 log("current job: " .. (currentId and shortId(currentId) or "unknown"), currentId and C.mid or C.red)
-log("rightshift toggle · F2 hop · F3 scan · servers tab = browse")
+log("rightshift toggle · F2 hop · F3 scan · F4 hunt bee · servers tab = browse")
 setStatus("ok", "ready")
 
-if cfg.hopOnJoin then
+-- Vicious bee mode takes priority over plain auto-hop
+if cfg.viciousBeeMode then
+    log("vicious bee hunter: ON — checking this server (unload to cancel)", C.yellow)
+    task.delay(3, huntViciousBee)
+elseif cfg.hopOnJoin then
     log("auto hop on join: ON — hopping in 3s (unload to cancel)", C.yellow)
     task.delay(3, function() if not unloaded and not hopping then doHop() end end)
 end
