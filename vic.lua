@@ -83,11 +83,10 @@ local config = {
 }
 
 local persistConfig = {
-    themeIdx = 1,
+    themeIdx = 1,   -- default blue (midnight)
     scale = 1,
     preferLessFull = true,
     skipEmpty = true,
-    rainbowEnabled = true,
 }
 
 local function loadConfigFromDisk()
@@ -99,7 +98,6 @@ local function loadConfigFromDisk()
         if type(data.scale) == "number" then persistConfig.scale = data.scale end
         if type(data.preferLessFull) == "boolean" then persistConfig.preferLessFull = data.preferLessFull end
         if type(data.skipEmpty) == "boolean" then persistConfig.skipEmpty = data.skipEmpty end
-        if type(data.rainbowEnabled) == "boolean" then persistConfig.rainbowEnabled = data.rainbowEnabled end
     end
 end
 
@@ -129,14 +127,9 @@ local currentScale = persistConfig.scale or 1
 local targetScale = persistConfig.scale or 1
 local scaleVelocity = 0
 local currentThemeIdx = persistConfig.themeIdx or 1
+-- validate theme index bounds after we know how many themes there are
 local hopping = false
 local lastHopTime = 0
-
--- Rainbow state
-local rainbowEnabled = persistConfig.rainbowEnabled
-local rainbowActive = false
-local rainbowPhase = 0
-local rainbowTargets = {}   -- list of {obj, prop, mode}
 
 local U = {}
 local accentListeners = {}
@@ -207,6 +200,7 @@ local C = {
     red      = Color3.fromRGB(240, 130, 140),
 }
 
+-- Theme list — rainbow is a real theme now
 local themes = {
     {name="midnight", c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255)},
     {name="emerald",  c1=Color3.fromRGB(36,100,90),  c2=Color3.fromRGB(18,40,42),  c3=Color3.fromRGB(45,80,75),   accent=Color3.fromRGB(105,200,155), accentHi=Color3.fromRGB(140,225,180)},
@@ -214,7 +208,14 @@ local themes = {
     {name="sunset",   c1=Color3.fromRGB(140,70,45),  c2=Color3.fromRGB(60,32,40),  c3=Color3.fromRGB(120,55,90),  accent=Color3.fromRGB(230,160,90),  accentHi=Color3.fromRGB(250,190,120)},
     {name="violet",   c1=Color3.fromRGB(95,55,155),  c2=Color3.fromRGB(38,25,65),  c3=Color3.fromRGB(120,55,130), accent=Color3.fromRGB(170,130,235), accentHi=Color3.fromRGB(195,160,255)},
     {name="mono",     c1=Color3.fromRGB(75,75,82),   c2=Color3.fromRGB(38,38,42),  c3=Color3.fromRGB(58,58,65),   accent=Color3.fromRGB(180,185,200), accentHi=Color3.fromRGB(210,215,230)},
+    {name="rainbow",  c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255), rainbow=true},
 }
+
+-- Validate loaded theme index
+if currentThemeIdx < 1 or currentThemeIdx > #themes then
+    currentThemeIdx = 1
+    persistConfig.themeIdx = 1
+end
 
 local WIN_W, WIN_H = 460, 580
 local HEADER_H = 58
@@ -229,12 +230,6 @@ gui.Parent = localPlayer:WaitForChild("PlayerGui")
 
 local function registerAccent(obj, prop, use)
     table.insert(accentListeners, {obj = obj, prop = prop, use = use})
-end
-
--- Rainbow API: register {obj, prop} pairs that should cycle hue while rainbowActive
-local function registerRainbow(obj, prop, mode)
-    mode = mode or "hue"  -- "hue" = single Color3, "grad" = UIGradient ColorSequence
-    table.insert(rainbowTargets, {obj = obj, prop = prop, mode = mode})
 end
 
 local function lerpNumberSeq(a, b, t)
@@ -417,46 +412,101 @@ local function glassButton(parent, height, order)
     return b
 end
 
+-- Global state for whether the rainbow theme is active
+local rainbowThemeActive = false
+local rainbowHue = 0
+
 local function applyTheme(idx, save)
     if unloaded then return end
     currentThemeIdx = idx
     persistConfig.themeIdx = idx
     if save then saveConfigToDisk() end
     local t = themes[idx]
-    task.spawn(function()
-        local prev = themes[(idx - 2) % #themes + 1]
-        for s = 1, 24 do
-            if unloaded then break end
-            local p = s / 24
-            local ep = 1 - math.pow(1 - p, 3)
-            local c1 = prev.c1:Lerp(t.c1, ep)
-            local c2 = prev.c2:Lerp(t.c2, ep)
-            local c3 = prev.c3:Lerp(t.c3, ep)
+    rainbowThemeActive = t.rainbow == true
+
+    if not rainbowThemeActive then
+        task.spawn(function()
+            local prev = themes[(idx - 2) % #themes + 1]
+            for s = 1, 24 do
+                if unloaded then break end
+                local p = s / 24
+                local ep = 1 - math.pow(1 - p, 3)
+                local c1 = prev.c1:Lerp(t.c1, ep)
+                local c2 = prev.c2:Lerp(t.c2, ep)
+                local c3 = prev.c3:Lerp(t.c3, ep)
+                if U.bgGrad then
+                    U.bgGrad.Color = ColorSequence.new({
+                        ColorSequenceKeypoint.new(0.0, c1),
+                        ColorSequenceKeypoint.new(0.5, c2),
+                        ColorSequenceKeypoint.new(1.0, c3),
+                    })
+                end
+                task.wait(0.03)
+            end
+        end)
+        if U.orb1 then tweenService:Create(U.orb1, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c1}):Play() end
+        if U.orb2 then tweenService:Create(U.orb2, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c3}):Play() end
+        if U.orb3 then tweenService:Create(U.orb3, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c2}):Play() end
+        for _, listener in ipairs(accentListeners) do
+            if listener.obj and listener.obj.Parent then
+                if listener.use == "grad" then
+                    tweenColorSeq(listener.obj, ColorSequence.new(t.accentHi, t.accent), 0.6)
+                else
+                    local target = (listener.use == "hi") and t.accentHi or t.accent
+                    tweenService:Create(listener.obj, TweenInfo.new(0.6, Enum.EasingStyle.Quart), {[listener.prop] = target}):Play()
+                end
+            end
+        end
+    end
+
+    if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
+end
+
+-- Slow uniform rainbow driver (no waves, just a smooth rotation of hue)
+task.spawn(function()
+    local t = 0
+    while not unloaded do
+        local dt = runService.RenderStepped:Wait()
+        if rainbowThemeActive then
+            t = t + dt * 0.08   -- ~12 seconds per full hue cycle
+            rainbowHue = t % 1
+            local hue = rainbowHue
+
+            -- Background gradient: shift hue smoothly, no per-keypoint waves
             if U.bgGrad then
+                local c1 = Color3.fromHSV(hue, 0.55, 0.55)
+                local c2 = Color3.fromHSV((hue + 0.05) % 1, 0.55, 0.22)
+                local c3 = Color3.fromHSV((hue + 0.10) % 1, 0.55, 0.45)
                 U.bgGrad.Color = ColorSequence.new({
                     ColorSequenceKeypoint.new(0.0, c1),
                     ColorSequenceKeypoint.new(0.5, c2),
                     ColorSequenceKeypoint.new(1.0, c3),
                 })
             end
-            task.wait(0.03)
-        end
-    end)
-    if U.orb1 then tweenService:Create(U.orb1, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c1}):Play() end
-    if U.orb2 then tweenService:Create(U.orb2, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c3}):Play() end
-    if U.orb3 then tweenService:Create(U.orb3, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c2}):Play() end
-    if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
-    for _, listener in ipairs(accentListeners) do
-        if listener.obj and listener.obj.Parent then
-            if listener.use == "grad" then
-                tweenColorSeq(listener.obj, ColorSequence.new(t.accentHi, t.accent), 0.6)
-            else
-                local target = (listener.use == "hi") and t.accentHi or t.accent
-                tweenService:Create(listener.obj, TweenInfo.new(0.6, Enum.EasingStyle.Quart), {[listener.prop] = target}):Play()
+
+            -- Orbs: same hue family, offset slightly for depth
+            if U.orb1 then U.orb1.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.5) end
+            if U.orb2 then U.orb2.BackgroundColor3 = Color3.fromHSV((hue + 0.10) % 1, 0.55, 0.45) end
+            if U.orb3 then U.orb3.BackgroundColor3 = Color3.fromHSV((hue + 0.05) % 1, 0.55, 0.35) end
+
+            -- Accent listeners: uniform hue, uniform brightness
+            local acc1 = Color3.fromHSV(hue, 0.55, 1)
+            local acc2 = Color3.fromHSV(hue, 0.45, 1)
+            for _, listener in ipairs(accentListeners) do
+                if listener.obj and listener.obj.Parent then
+                    if listener.use == "grad" then
+                        listener.obj.Color = ColorSequence.new(acc2, acc1)
+                    else
+                        local target = (listener.use == "hi") and acc2 or acc1
+                        listener.obj[listener.prop] = target
+                    end
+                end
             end
+        else
+            task.wait(0.1)
         end
     end
-end
+end)
 
 local function setStatus(state, txt)
     if not U.statusDot then return end
@@ -470,40 +520,6 @@ local function setStatus(state, txt)
     U.statusText.Text = label
     if U.pillDot then U.pillDot.BackgroundColor3 = col end
 end
-
--- ============ RAINBOW ============
-
-local function setRainbow(on)
-    rainbowActive = on and rainbowEnabled or false
-end
-
-task.spawn(function()
-    local t = 0
-    while not unloaded do
-        if rainbowActive then
-            t = t + 0.012
-            rainbowPhase = t
-            local hueBase = (t % 1)
-            for _, entry in ipairs(rainbowTargets) do
-                local obj = entry.obj
-                if obj and obj.Parent then
-                    if entry.mode == "grad" then
-                        local c1 = Color3.fromHSV((hueBase) % 1, 0.75, 1)
-                        local c2 = Color3.fromHSV((hueBase + 0.33) % 1, 0.75, 1)
-                        obj.Color = ColorSequence.new(c1, c2)
-                    elseif entry.mode == "stroke" then
-                        obj[entry.prop] = Color3.fromHSV((hueBase) % 1, 0.85, 1)
-                    else
-                        obj[entry.prop] = Color3.fromHSV((hueBase) % 1, 0.7, 1)
-                    end
-                end
-            end
-            runService.RenderStepped:Wait()
-        else
-            task.wait(0.1)
-        end
-    end
-end)
 
 -- ============ FETCH + HOP LOGIC ============
 
@@ -527,7 +543,6 @@ local function fetchPage(cursor)
     return ok3 and decoded or nil
 end
 
--- Walk every page, return full list of {id, playing, maxPlayers, ping, fps}
 local function scanAllServers(progressCb)
     local all = {}
     local cursor = nil
@@ -594,7 +609,6 @@ local function scanServers()
     return candidates
 end
 
--- Render the live server list into the "servers" tab
 function U.renderServerList(list)
     if not U.serverListFrame then return end
     for _, c in ipairs(U.serverListFrame:GetChildren()) do
@@ -626,7 +640,6 @@ function U.renderServerList(list)
         return
     end
 
-    -- Sort: not blacklisted, not full, most populated first
     table.sort(list, function(a, b)
         local aBad = (blacklist[a.id] or a.id == currentServerId or sessionVisited[a.id])
         local bBad = (blacklist[b.id] or b.id == currentServerId or sessionVisited[b.id])
@@ -663,7 +676,6 @@ function U.renderServerList(list)
         rStroke.Thickness = 1
         rStroke.Transparency = 0.65
 
-        -- Status dot
         local dot = Instance.new("Frame", row)
         dot.Size = UDim2.new(0, 7, 0, 7)
         dot.Position = UDim2.new(0, 14, 0.5, -3)
@@ -704,7 +716,6 @@ function U.renderServerList(list)
             (s.ping and s.ping > 0 and ("  " .. s.ping .. "ms") or "")
         countLbl.ZIndex = 7
 
-        -- Left-click to hop to this specific server
         track(row.MouseButton1Click:Connect(function()
             if hopping then return end
             if isCurrent then logWarn("already in that server") return end
@@ -738,7 +749,6 @@ function U.refreshServerScan()
     if U.scanInProgress then return end
     U.scanInProgress = true
     setStatus("loading", "scanning")
-    setRainbow(true)
     logInfo("scanning all servers...")
     task.spawn(function()
         local all = scanAllServers(function(page, count)
@@ -753,7 +763,6 @@ function U.refreshServerScan()
         end
         U.scanInProgress = false
         setStatus("ok", "ready")
-        setRainbow(false)
     end)
 end
 
@@ -761,7 +770,6 @@ local function doHop()
     if hopping then return end
     hopping = true
     setStatus("loading", "scanning")
-    setRainbow(true)
     logInfo("hopping — session " .. sessionId)
 
     task.spawn(function()
@@ -775,7 +783,6 @@ local function doHop()
                 logWarn("try again in 1-2 minutes")
                 hopping = false
                 setStatus("ok", "ready")
-                setRainbow(false)
                 return
             end
 
@@ -787,7 +794,6 @@ local function doHop()
                 logBad("still no fresh servers")
                 hopping = false
                 setStatus("ok", "ready")
-                setRainbow(false)
                 return
             end
         end
@@ -824,7 +830,6 @@ local function doHop()
 
         task.delay(12, function()
             hopping = false
-            setRainbow(false)
         end)
     end)
 end
@@ -872,7 +877,6 @@ local function buildUI()
     winSG.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 0.88)})
     winSG.Rotation = 90
     draggable(container, win)
-    registerRainbow(winStroke, "Color", "stroke")
 
     local bgLayer = Instance.new("Frame", win)
     bgLayer.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
@@ -1087,7 +1091,7 @@ local function buildUI()
     track(btnMin.MouseEnter:Connect(function() tw(btnMin, {BackgroundTransparency = 0.7, TextColor3 = C.text}, 0.18) end))
     track(btnMin.MouseLeave:Connect(function() tw(btnMin, {BackgroundTransparency = 0.85, TextColor3 = C.textMid}, 0.22) end))
 
-    -- Tabs: logs / servers / config / blacklist
+    -- Tabs
     local tabsBar = Instance.new("Frame", win)
     tabsBar.BackgroundTransparency = 1
     tabsBar.Size = UDim2.new(1, 0, 0, TABS_H)
@@ -1124,7 +1128,6 @@ local function buildUI()
     tuG.Color = ColorSequence.new(C.accentHi, C.accent)
     tuG.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(1, 0.6)})
     registerAccent(tuG, "Color", "grad")
-    registerRainbow(tuG, "Color", "grad")
 
     local content = Instance.new("Frame", win)
     content.BackgroundTransparency = 1
@@ -1164,7 +1167,6 @@ local function buildUI()
         for n, b in pairs(tabBtns) do
             tw(b, {TextColor3 = (n == name) and C.text or C.textDim}, 0.24)
         end
-        -- Auto-scan when opening servers tab
         if name == "servers" and U.refreshServerScan then
             U.refreshServerScan()
         end
@@ -1315,7 +1317,6 @@ local function buildUI()
     sbStroke.Transparency = 0.55
     registerAccent(hopBtn, "BackgroundColor3", "accent")
     registerAccent(sbGrad, "Color", "grad")
-    registerRainbow(sbGrad, "Color", "grad")
 
     local clearBtn = Instance.new("TextButton", inputBar)
     clearBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
@@ -1486,7 +1487,21 @@ local function buildUI()
 
     for i, t in ipairs(themes) do
         local sw = Instance.new("TextButton", swatchRow)
-        sw.BackgroundColor3 = t.c1
+        -- For rainbow theme, make swatch a mini gradient; else solid color
+        if t.rainbow then
+            sw.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            local swRainbow = Instance.new("UIGradient", sw)
+            swRainbow.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 80, 80)),
+                ColorSequenceKeypoint.new(0.25, Color3.fromRGB(255, 220, 80)),
+                ColorSequenceKeypoint.new(0.5, Color3.fromRGB(120, 255, 120)),
+                ColorSequenceKeypoint.new(0.75, Color3.fromRGB(120, 180, 255)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(220, 120, 255)),
+            })
+            swRainbow.Rotation = 45
+        else
+            sw.BackgroundColor3 = t.c1
+        end
         sw.BorderSizePixel = 0
         sw.Size = UDim2.new(0, 26, 0, 26)
         sw.Text = ""
@@ -1494,9 +1509,11 @@ local function buildUI()
         sw.LayoutOrder = i
         sw.ZIndex = 6
         Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
-        local swGrad = Instance.new("UIGradient", sw)
-        swGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255):Lerp(t.c1, 0.6), t.c1)
-        swGrad.Rotation = 90
+        if not t.rainbow then
+            local swGrad = Instance.new("UIGradient", sw)
+            swGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255):Lerp(t.c1, 0.6), t.c1)
+            swGrad.Rotation = 90
+        end
         local swStroke = Instance.new("UIStroke", sw)
         swStroke.Color = (i == currentThemeIdx) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 185, 200)
         swStroke.Thickness = (i == currentThemeIdx) and 2 or 1
@@ -1588,30 +1605,13 @@ local function buildUI()
     toggleRow(tScroll, "prefer less full servers", config.preferLessFull, function(v)
         config.maxPlayerRatio = v and 0.9 or 1.0
     end, 7, "preferLessFull")
-    toggleRow(tScroll, "rainbow animation", rainbowEnabled, function(v)
-        rainbowEnabled = v
-        if not v then
-            setRainbow(false)
-            -- Reset rainbow targets back to theme accent
-            for _, entry in ipairs(rainbowTargets) do
-                if entry.obj and entry.obj.Parent then
-                    if entry.mode == "grad" then
-                        local t = themes[currentThemeIdx]
-                        entry.obj.Color = ColorSequence.new(t.accentHi, t.accent)
-                    end
-                end
-            end
-            -- restore window stroke + tab underline to default
-            if U.bgGrad then end
-        end
-    end, 8, "rainbowEnabled")
 
-    section(tScroll, "limits", 10)
+    section(tScroll, "limits", 9)
     toggleRow(tScroll, "skip empty servers", config.skipEmpty, function(v)
         config.minPlayers = v and 1 or 0
-    end, 11, "skipEmpty")
+    end, 10, "skipEmpty")
 
-    section(tScroll, "system", 13)
+    section(tScroll, "system", 12)
 
     local unloadBtn = Instance.new("TextButton", tScroll)
     unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 55, 70)
@@ -1620,7 +1620,7 @@ local function buildUI()
     unloadBtn.Size = UDim2.new(1, 0, 0, 52)
     unloadBtn.Text = ""
     unloadBtn.AutoButtonColor = false
-    unloadBtn.LayoutOrder = 14
+    unloadBtn.LayoutOrder = 13
     unloadBtn.ZIndex = 5
     Instance.new("UICorner", unloadBtn).CornerRadius = UDim.new(0, 10)
     local ubGrad = Instance.new("UIGradient", unloadBtn)
@@ -2005,18 +2005,22 @@ end
 
 buildUI()
 
--- Apply initial theme accent colors
+-- Apply initial theme (restores persisted theme + accent colors)
 local t0 = themes[currentThemeIdx]
-for _, listener in ipairs(accentListeners) do
-    if listener.obj and listener.obj.Parent then
-        if listener.use == "grad" then
-            listener.obj.Color = ColorSequence.new(t0.accentHi, t0.accent)
-        else
-            local target = (listener.use == "hi") and t0.accentHi or t0.accent
-            listener.obj[listener.prop] = target
+rainbowThemeActive = t0.rainbow == true
+if not rainbowThemeActive then
+    for _, listener in ipairs(accentListeners) do
+        if listener.obj and listener.obj.Parent then
+            if listener.use == "grad" then
+                listener.obj.Color = ColorSequence.new(t0.accentHi, t0.accent)
+            else
+                local target = (listener.use == "hi") and t0.accentHi or t0.accent
+                listener.obj[listener.prop] = target
+            end
         end
     end
 end
+if U.themeLabel then U.themeLabel.Text = "theme · " .. t0.name end
 
 if U.refreshBlacklist then U.refreshBlacklist() end
 
