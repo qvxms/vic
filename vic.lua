@@ -26,16 +26,97 @@ local VERSION = "v0.1 beta"
 local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
 local discordLink = "https://discord.gg/3MpTfDpSZ6"
 local blacklistFile = "hopper_blacklist.json"
+local configFile    = "hopper_config.json"
 
--- Config
+-- ============ SESSION ============
+local sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+local sessionFile = "hopper_session_" .. sessionId .. ".log"
+local sessionLogs = {}       -- in-memory log lines for this session
+local MAX_SESSION_LOGS = 200 -- cap in-memory; disk keeps full history
+
+local function diskAppend(path, line)
+    if not writefile or not readfile then return end
+    local ok, existing = pcall(function() return readfile(path) end)
+    local content = (ok and existing) or ""
+    -- keep file from growing forever: cap at ~2000 lines
+    local lines = {}
+    for l in content:gmatch("[^\n]+") do table.insert(lines, l) end
+    table.insert(lines, line)
+    while #lines > 2000 do table.remove(lines, 1) end
+    pcall(function() writefile(path, table.concat(lines, "\n")) end)
+end
+
+local function sessionLog(prefix, speaker, text, color)
+    color = color or Color3.fromRGB(242, 244, 250)
+    local line = prefix .. speaker .. ": " .. text
+    table.insert(sessionLogs, line)
+    if #sessionLogs > MAX_SESSION_LOGS then table.remove(sessionLogs, 1) end
+    -- only write hop-related lines to disk (per request: log it for server hops)
+    if speaker == "hopper" and (
+        text:find("^hopping") or text:find("selected") or text:find("landed") or
+        text:find("no fresh") or text:find("rerouted") or text:find("manual hop") or
+        text:find("scanning") or text:find("found %d+ candidates") or
+        text:find("giving up") or text:find("retry")
+    ) then
+        diskAppend(sessionFile, "[" .. os.date("%H:%M:%S") .. "] " .. line)
+    end
+    if U.chatLabel then
+        local out = {}
+        for _, l in ipairs(sessionLogs) do table.insert(out, l) end
+        U.chatLabel.Text = table.concat(out, "\n")
+    end
+end
+
+local function log(text, color) sessionLog("·  ", "hopper", text, color or Color3.fromRGB(168, 172, 188)) end
+local function logInfo(text) log(text, Color3.fromRGB(120, 170, 245)) end
+local function logGood(text) log(text, Color3.fromRGB(130, 220, 165)) end
+local function logWarn(text) log(text, Color3.fromRGB(240, 205, 120)) end
+local function logBad(text) log(text, Color3.fromRGB(240, 130, 140)) end
+
+-- ============ CONFIG (persisted) ============
 local config = {
     maxPages = 15,
     minPlayers = 1,
     maxPlayerRatio = 1.0,
     autoHopDelay = 3,
-    hopOnJoin = false,
-    useRegionFilter = false,
+    hopOnJoin = false,       -- NEVER persisted — always off on new session
+    preferLessFull = true,
+    skipEmpty = true,
 }
+
+local persistConfig = {
+    themeIdx = 1,
+    scale = 1,
+    preferLessFull = true,
+    skipEmpty = true,
+}
+
+local function loadConfigFromDisk()
+    if not readfile or not isfile then return end
+    if not isfile(configFile) then return end
+    local ok, data = pcall(function() return httpService:JSONDecode(readfile(configFile)) end)
+    if ok and type(data) == "table" then
+        if type(data.themeIdx) == "number" then persistConfig.themeIdx = data.themeIdx end
+        if type(data.scale) == "number" then persistConfig.scale = data.scale end
+        if type(data.preferLessFull) == "boolean" then persistConfig.preferLessFull = data.preferLessFull end
+        if type(data.skipEmpty) == "boolean" then persistConfig.skipEmpty = data.skipEmpty end
+    end
+end
+
+local function saveConfigToDisk()
+    if not writefile then return end
+    pcall(function()
+        writefile(configFile, httpService:JSONEncode(persistConfig))
+    end)
+end
+
+loadConfigFromDisk()
+
+-- Apply loaded config
+config.preferLessFull = persistConfig.preferLessFull
+config.skipEmpty = persistConfig.skipEmpty
+config.maxPlayerRatio = config.preferLessFull and 0.9 or 1.0
+config.minPlayers = config.skipEmpty and 1 or 0
 
 local blacklist = {}
 local sessionVisited = {}
@@ -45,15 +126,12 @@ local MAX_AUTO_RETRIES = 4
 
 local connections = {}
 local unloaded = false
-local currentScale = 1
-local targetScale = 1
+local currentScale = persistConfig.scale or 1
+local targetScale = persistConfig.scale or 1
 local scaleVelocity = 0
-local currentThemeIdx = 1
+local currentThemeIdx = persistConfig.themeIdx or 1
 local hopping = false
 local lastHopTime = 0
-
-local logs = {}
-local MAX_LOGS = 60
 
 local U = {}
 local accentListeners = {}
@@ -83,15 +161,12 @@ loadBlacklist()
 
 -- Try to grab a reliable current-server identifier
 local function getCurrentServerId()
-    -- 1. game.JobId (works on most desktop executors)
     local jid = game.JobId
     if jid and jid ~= "" then return tostring(jid) end
 
-    -- 2. Read from TeleportService's internal (works when JobId is hidden)
     local ok, info = pcall(function() return teleportService:GetLocalPlayerTeleportData() end)
     if ok and type(info) == "table" and info.JobId then return tostring(info.JobId) end
 
-    -- 3. Give up
     return nil
 end
 
@@ -102,7 +177,6 @@ if currentServerId then
     saveBlacklist()
 end
 
--- Detect "I just landed back on the same server" after a hop
 task.spawn(function()
     if expectedJobId and currentServerId and currentServerId == expectedJobId then
         expectedJobId = nil
@@ -112,24 +186,6 @@ task.spawn(function()
         hopAttempts = 0
     end
 end)
-
-local function logLine(prefix, speaker, text, color)
-    color = color or Color3.fromRGB(242, 244, 250)
-    local line = prefix .. speaker .. ": " .. text
-    table.insert(logs, {text = line, color = color})
-    if #logs > MAX_LOGS then table.remove(logs, 1) end
-    if U.chatLabel then
-        local out = {}
-        for _, l in ipairs(logs) do table.insert(out, l.text) end
-        U.chatLabel.Text = table.concat(out, "\n")
-    end
-end
-
-local function log(text, color) logLine("·  ", "hopper", text, color or Color3.fromRGB(168, 172, 188)) end
-local function logInfo(text) log(text, Color3.fromRGB(120, 170, 245)) end
-local function logGood(text) log(text, Color3.fromRGB(130, 220, 165)) end
-local function logWarn(text) log(text, Color3.fromRGB(240, 205, 120)) end
-local function logBad(text) log(text, Color3.fromRGB(240, 130, 140)) end
 
 local function shortId(id)
     id = tostring(id)
@@ -161,7 +217,6 @@ local themes = {
 local WIN_W, WIN_H = 460, 580
 local HEADER_H = 58
 local TABS_H = 36
-local MIN_W, MIN_H = 340, 320
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "hopper"
@@ -354,9 +409,11 @@ local function glassButton(parent, height, order)
     return b
 end
 
-local function applyTheme(idx)
+local function applyTheme(idx, save)
     if unloaded then return end
     currentThemeIdx = idx
+    persistConfig.themeIdx = idx
+    if save then saveConfigToDisk() end
     local t = themes[idx]
     task.spawn(function()
         local prev = themes[(idx - 2) % #themes + 1]
@@ -443,16 +500,13 @@ local function scanServers()
             totalScanned = totalScanned + 1
             local id = tostring(s.id)
 
-            -- Hard skip: current server, any blacklisted, any visited this session
             if id == currentServerId or blacklist[id] or sessionVisited[id] then
                 skippedBlacklist = skippedBlacklist + 1
             elseif s.playing >= s.maxPlayers then
-                -- Strictly skip FULL servers
                 skippedFull = skippedFull + 1
             elseif s.playing < config.minPlayers then
                 -- too empty
             elseif s.playing >= (s.maxPlayers - 1) and config.maxPlayerRatio < 1.0 then
-                -- reserve at least 1 slot
                 skippedFull = skippedFull + 1
             else
                 table.insert(candidates, s)
@@ -477,6 +531,7 @@ local function doHop()
     if hopping then return end
     hopping = true
     setStatus("loading", "scanning")
+    logInfo("hopping — session " .. sessionId)
 
     task.spawn(function()
         local candidates = scanServers()
@@ -504,7 +559,6 @@ local function doHop()
             end
         end
 
-        -- Prefer the server with the most players, pick randomly among top third
         table.sort(candidates, function(a, b) return a.playing > b.playing end)
         local poolSize = math.max(1, math.floor(#candidates / 3))
         local chosen = candidates[math.random(1, poolSize)]
@@ -521,7 +575,6 @@ local function doHop()
         lastHopTime = tick()
         task.wait(0.7)
 
-        -- Attempt 1: TeleportAsync with proper options
         local ok = pcall(function()
             local opts = Instance.new("TeleportOptions")
             opts.ServerInstanceId = tostring(chosen.id)
@@ -551,7 +604,7 @@ local function buildUI()
     container.ZIndex = 1
     U.container = container
     local containerScale = Instance.new("UIScale", container)
-    containerScale.Scale = 1
+    containerScale.Scale = currentScale
     U.containerScale = containerScale
 
     track(runService.RenderStepped:Connect(function(dt)
@@ -712,7 +765,7 @@ local function buildUI()
     subL.TextSize = 10
     subL.TextColor3 = C.textDim
     subL.TextXAlignment = Enum.TextXAlignment.Left
-    subL.Text = "get somewhere fresh"
+    subL.Text = "session " .. sessionId
     subL.ZIndex = 7
 
     local hRight = Instance.new("Frame", header)
@@ -882,7 +935,6 @@ local function buildUI()
     tabUnderline.Position = UDim2.new((idx - 1) / 3, 40, 1, -4)
     tabBtns[activeTab].TextColor3 = C.text
 
-    -- Section helper
     local function section(parent, txt, order)
         local f = Instance.new("Frame", parent)
         f.BackgroundTransparency = 1
@@ -902,8 +954,7 @@ local function buildUI()
         pl.PaddingLeft = UDim.new(0, 4)
     end
 
-    -- Toggle row helper
-    local function toggleRow(parent, label, initial, cb, order)
+    local function toggleRow(parent, label, initial, cb, order, persistKey)
         local b = glassButton(parent, 48, order)
         Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
         local rowPad = Instance.new("UIPadding", b)
@@ -941,6 +992,10 @@ local function buildUI()
             tw(toggleTrack, {
                 BackgroundColor3 = state and C.green or Color3.fromRGB(64, 66, 78),
             }, 0.28)
+            if persistKey then
+                persistConfig[persistKey] = state
+                saveConfigToDisk()
+            end
             cb(state)
         end))
         return b
@@ -1050,7 +1105,7 @@ local function buildUI()
     end))
 
     track(clearBtn.MouseButton1Click:Connect(function()
-        logs = {}
+        sessionLogs = {}
         if U.chatLabel then U.chatLabel.Text = "" end
     end))
 
@@ -1124,7 +1179,7 @@ local function buildUI()
         track(sw.MouseEnter:Connect(function() tw(sw, {Size = UDim2.new(0, 30, 0, 30)}, 0.2, Enum.EasingStyle.Back) end))
         track(sw.MouseLeave:Connect(function() tw(sw, {Size = UDim2.new(0, 26, 0, 26)}, 0.24, Enum.EasingStyle.Quart) end))
         track(sw.MouseButton1Click:Connect(function()
-            applyTheme(i)
+            applyTheme(i, true)
             for _, child in ipairs(swatchRow:GetChildren()) do
                 if child:IsA("TextButton") then
                     local st = child:FindFirstChildOfClass("UIStroke")
@@ -1187,22 +1242,33 @@ local function buildUI()
     scaleBtn("−", 1, function()
         targetScale = clamp(targetScale - 0.1, 0.7, 1.5)
         scaleLabel.Text = "zoom · " .. string.format("%.2f", targetScale)
+        persistConfig.scale = targetScale
+        saveConfigToDisk()
     end)
     scaleBtn("1", 2, function()
         targetScale = 1
         scaleLabel.Text = "zoom · 1.00"
+        persistConfig.scale = 1
+        saveConfigToDisk()
     end)
     scaleBtn("+", 3, function()
         targetScale = clamp(targetScale + 0.1, 0.7, 1.5)
         scaleLabel.Text = "zoom · " .. string.format("%.2f", targetScale)
+        persistConfig.scale = targetScale
+        saveConfigToDisk()
     end)
 
     section(tScroll, "behavior", 5)
-    toggleRow(tScroll, "auto hop on join", config.hopOnJoin, function(v) config.hopOnJoin = v end, 6)
-    toggleRow(tScroll, "prefer less full servers", true, function(v) config.maxPlayerRatio = v and 0.9 or 1.0 end, 7)
+    -- hopOnJoin is intentionally NOT persisted — always false each session
+    toggleRow(tScroll, "auto hop on join", false, function(v) config.hopOnJoin = v end, 6, nil)
+    toggleRow(tScroll, "prefer less full servers", config.preferLessFull, function(v)
+        config.maxPlayerRatio = v and 0.9 or 1.0
+    end, 7, "preferLessFull")
 
     section(tScroll, "limits", 9)
-    toggleRow(tScroll, "skip empty servers", true, function(v) config.minPlayers = v and 1 or 0 end, 10)
+    toggleRow(tScroll, "skip empty servers", config.skipEmpty, function(v)
+        config.minPlayers = v and 1 or 0
+    end, 10, "skipEmpty")
 
     section(tScroll, "system", 12)
 
@@ -1648,13 +1714,16 @@ _G.__hopper_unload = unload
 do
     local blCount = 0
     for _ in pairs(blacklist) do blCount = blCount + 1 end
+    log("session " .. sessionId .. " started")
     log("loaded " .. blCount .. " blacklisted servers")
 end
 log("current job: " .. (currentServerId and shortId(currentServerId) or "unknown"),
     currentServerId and C.textMid or C.red)
+log("hop on join: OFF (resets every session)")
 log("rightshift toggle · F2 hop · manual button on logs tab")
 setStatus("ok", "ready")
 
+-- hopOnJoin is hardcoded false each session — the toggle just changes behavior for this session
 if config.hopOnJoin then
     task.spawn(function()
         task.wait(config.autoHopDelay)
