@@ -1,4 +1,4 @@
---// Server Hopper — styled after grycan
+--// Server Hopper
 local players = game:GetService("Players")
 local httpService = game:GetService("HttpService")
 local userInput = game:GetService("UserInputService")
@@ -22,9 +22,7 @@ local http = (syn and syn.request) or (http and http.request) or http_request or
 if not http then _G.__hopper_loaded = false warn("no http executor") return end
 
 local VERSION = "v0.1 beta"
-
 local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
-local discordLink = "https://discord.gg/3MpTfDpSZ6"
 local blacklistFile = "hopper_blacklist.json"
 local configFile    = "hopper_config.json"
 
@@ -83,7 +81,7 @@ local config = {
 }
 
 local persistConfig = {
-    themeIdx = 1,   -- default blue (midnight)
+    themeIdx = 1,
     scale = 1,
     preferLessFull = true,
     skipEmpty = true,
@@ -127,9 +125,7 @@ local currentScale = persistConfig.scale or 1
 local targetScale = persistConfig.scale or 1
 local scaleVelocity = 0
 local currentThemeIdx = persistConfig.themeIdx or 1
--- validate theme index bounds after we know how many themes there are
 local hopping = false
-local lastHopTime = 0
 
 local U = {}
 local accentListeners = {}
@@ -137,7 +133,6 @@ local accentListeners = {}
 local function track(c) table.insert(connections, c) return c end
 local function clamp(n, a, b) return math.max(a, math.min(b, n)) end
 
--- Blacklist persistence
 local function loadBlacklist()
     if readfile and isfile and isfile(blacklistFile) then
         local ok, data = pcall(function() return httpService:JSONDecode(readfile(blacklistFile)) end)
@@ -172,16 +167,6 @@ if currentServerId then
     saveBlacklist()
 end
 
-task.spawn(function()
-    if expectedJobId and currentServerId and currentServerId == expectedJobId then
-        expectedJobId = nil
-        hopAttempts = 0
-    elseif expectedJobId and currentServerId and currentServerId ~= expectedJobId then
-        expectedJobId = nil
-        hopAttempts = 0
-    end
-end)
-
 local function shortId(id)
     id = tostring(id)
     return #id > 10 and id:sub(1, 10) or id
@@ -200,7 +185,7 @@ local C = {
     red      = Color3.fromRGB(240, 130, 140),
 }
 
--- Theme list — rainbow is a real theme now
+-- Theme list — rainbow is a normal entry, just flagged so the loop knows to animate it
 local themes = {
     {name="midnight", c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255)},
     {name="emerald",  c1=Color3.fromRGB(36,100,90),  c2=Color3.fromRGB(18,40,42),  c3=Color3.fromRGB(45,80,75),   accent=Color3.fromRGB(105,200,155), accentHi=Color3.fromRGB(140,225,180)},
@@ -211,7 +196,6 @@ local themes = {
     {name="rainbow",  c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255), rainbow=true},
 }
 
--- Validate loaded theme index
 if currentThemeIdx < 1 or currentThemeIdx > #themes then
     currentThemeIdx = 1
     persistConfig.themeIdx = 1
@@ -412,19 +396,17 @@ local function glassButton(parent, height, order)
     return b
 end
 
--- Global state for whether the rainbow theme is active
-local rainbowThemeActive = false
-local rainbowHue = 0
-
+-- Apply a theme. Handles both solid themes and rainbow (which just primes the loop).
 local function applyTheme(idx, save)
     if unloaded then return end
     currentThemeIdx = idx
     persistConfig.themeIdx = idx
     if save then saveConfigToDisk() end
     local t = themes[idx]
-    rainbowThemeActive = t.rainbow == true
 
-    if not rainbowThemeActive then
+    -- For solid themes: tween bg + orbs + accents
+    -- For rainbow: let the rainbow driver take over on next frame (no need to pre-set)
+    if not t.rainbow then
         task.spawn(function()
             local prev = themes[(idx - 2) % #themes + 1]
             for s = 1, 24 do
@@ -462,21 +444,19 @@ local function applyTheme(idx, save)
     if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
 end
 
--- Slow uniform rainbow driver (no waves, just a smooth rotation of hue)
+-- Single rainbow loop. Only does work when current theme is rainbow.
 task.spawn(function()
-    local t = 0
+    local hue = 0
     while not unloaded do
         local dt = runService.RenderStepped:Wait()
-        if rainbowThemeActive then
-            t = t + dt * 0.08   -- ~12 seconds per full hue cycle
-            rainbowHue = t % 1
-            local hue = rainbowHue
+        if themes[currentThemeIdx].rainbow then
+            hue = (hue + dt * 0.08) % 1  -- ~12s per cycle, smooth
 
-            -- Background gradient: shift hue smoothly, no per-keypoint waves
+            -- bg gradient: three keypoints, same hue family (very slight shift)
             if U.bgGrad then
                 local c1 = Color3.fromHSV(hue, 0.55, 0.55)
-                local c2 = Color3.fromHSV((hue + 0.05) % 1, 0.55, 0.22)
-                local c3 = Color3.fromHSV((hue + 0.10) % 1, 0.55, 0.45)
+                local c2 = Color3.fromHSV(hue, 0.55, 0.22)
+                local c3 = Color3.fromHSV(hue, 0.55, 0.45)
                 U.bgGrad.Color = ColorSequence.new({
                     ColorSequenceKeypoint.new(0.0, c1),
                     ColorSequenceKeypoint.new(0.5, c2),
@@ -484,12 +464,10 @@ task.spawn(function()
                 })
             end
 
-            -- Orbs: same hue family, offset slightly for depth
             if U.orb1 then U.orb1.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.5) end
-            if U.orb2 then U.orb2.BackgroundColor3 = Color3.fromHSV((hue + 0.10) % 1, 0.55, 0.45) end
-            if U.orb3 then U.orb3.BackgroundColor3 = Color3.fromHSV((hue + 0.05) % 1, 0.55, 0.35) end
+            if U.orb2 then U.orb2.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.45) end
+            if U.orb3 then U.orb3.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.35) end
 
-            -- Accent listeners: uniform hue, uniform brightness
             local acc1 = Color3.fromHSV(hue, 0.55, 1)
             local acc2 = Color3.fromHSV(hue, 0.45, 1)
             for _, listener in ipairs(accentListeners) do
@@ -502,8 +480,6 @@ task.spawn(function()
                     end
                 end
             end
-        else
-            task.wait(0.1)
         end
     end
 end)
@@ -779,16 +755,12 @@ local function doHop()
             hopAttempts = hopAttempts + 1
             if hopAttempts > MAX_AUTO_RETRIES then
                 logBad("giving up after " .. MAX_AUTO_RETRIES .. " failed attempts")
-                logWarn("roblox's public server API isn't returning fresh servers")
-                logWarn("try again in 1-2 minutes")
                 hopping = false
                 setStatus("ok", "ready")
                 return
             end
-
             logWarn("no candidates — retry " .. hopAttempts .. "/" .. MAX_AUTO_RETRIES .. " in 3s")
             task.wait(3)
-
             candidates = scanServers()
             if #candidates == 0 then
                 logBad("still no fresh servers")
@@ -811,7 +783,6 @@ local function doHop()
         end
 
         expectedJobId = tostring(chosen.id)
-        lastHopTime = tick()
         task.wait(0.7)
 
         local ok = pcall(function()
@@ -822,15 +793,13 @@ local function doHop()
         end)
 
         if not ok then
-            logWarn("teleportAsync failed — falling back to TeleportToPlaceInstance")
+            logWarn("teleportAsync failed — falling back")
             pcall(function()
                 teleportService:TeleportToPlaceInstance(game.PlaceId, tostring(chosen.id), localPlayer)
             end)
         end
 
-        task.delay(12, function()
-            hopping = false
-        end)
+        task.delay(12, function() hopping = false end)
     end)
 end
 
@@ -1091,7 +1060,6 @@ local function buildUI()
     track(btnMin.MouseEnter:Connect(function() tw(btnMin, {BackgroundTransparency = 0.7, TextColor3 = C.text}, 0.18) end))
     track(btnMin.MouseLeave:Connect(function() tw(btnMin, {BackgroundTransparency = 0.85, TextColor3 = C.textMid}, 0.22) end))
 
-    -- Tabs
     local tabsBar = Instance.new("Frame", win)
     tabsBar.BackgroundTransparency = 1
     tabsBar.Size = UDim2.new(1, 0, 0, TABS_H)
@@ -1487,8 +1455,8 @@ local function buildUI()
 
     for i, t in ipairs(themes) do
         local sw = Instance.new("TextButton", swatchRow)
-        -- For rainbow theme, make swatch a mini gradient; else solid color
         if t.rainbow then
+            -- rainbow swatch: multi-stop gradient
             sw.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
             local swRainbow = Instance.new("UIGradient", sw)
             swRainbow.Color = ColorSequence.new({
@@ -1501,6 +1469,9 @@ local function buildUI()
             swRainbow.Rotation = 45
         else
             sw.BackgroundColor3 = t.c1
+            local swGrad = Instance.new("UIGradient", sw)
+            swGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255):Lerp(t.c1, 0.6), t.c1)
+            swGrad.Rotation = 90
         end
         sw.BorderSizePixel = 0
         sw.Size = UDim2.new(0, 26, 0, 26)
@@ -1509,11 +1480,6 @@ local function buildUI()
         sw.LayoutOrder = i
         sw.ZIndex = 6
         Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
-        if not t.rainbow then
-            local swGrad = Instance.new("UIGradient", sw)
-            swGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255):Lerp(t.c1, 0.6), t.c1)
-            swGrad.Rotation = 90
-        end
         local swStroke = Instance.new("UIStroke", sw)
         swStroke.Color = (i == currentThemeIdx) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 185, 200)
         swStroke.Thickness = (i == currentThemeIdx) and 2 or 1
@@ -2005,10 +1971,9 @@ end
 
 buildUI()
 
--- Apply initial theme (restores persisted theme + accent colors)
+-- Prime the initial theme. If it's not rainbow, snap accents to saved theme.
 local t0 = themes[currentThemeIdx]
-rainbowThemeActive = t0.rainbow == true
-if not rainbowThemeActive then
+if not t0.rainbow then
     for _, listener in ipairs(accentListeners) do
         if listener.obj and listener.obj.Parent then
             if listener.use == "grad" then
@@ -2024,7 +1989,6 @@ if U.themeLabel then U.themeLabel.Text = "theme · " .. t0.name end
 
 if U.refreshBlacklist then U.refreshBlacklist() end
 
--- Keybinds
 local guiVisible = true
 track(userInput.InputBegan:Connect(function(input, gpe)
     if gpe then return end
@@ -2044,7 +2008,6 @@ track(userInput.InputBegan:Connect(function(input, gpe)
     end
 end))
 
--- Unload
 local function unload()
     if unloaded then return end
     unloaded = true
@@ -2058,7 +2021,6 @@ end
 
 _G.__hopper_unload = unload
 
--- Boot
 do
     local blCount = 0
     for _ in pairs(blacklist) do blCount = blCount + 1 end
