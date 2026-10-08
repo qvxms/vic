@@ -15,7 +15,7 @@ local BLACKLIST_FILE = "server_blacklist.json"
 local MAX_PAGES = 15
 local MIN_PLAYERS = 1
 local MAX_PLAYER_RATIO = 1.0
-local AUTO_HOP_DELAY = 3
+local AUTO_HOP_DELAY = 0
 local HOP_ON_JOIN = true
 local GUI_POSITION = UDim2.new(1, -400, 0, 60)  -- top-right below topbar
 
