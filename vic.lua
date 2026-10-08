@@ -18,7 +18,7 @@ if writefile and readfile and isfile and isfile(fileName) then
     end
 end
 
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1459586387031490580/LS84d1jaEqUy_3oyqKEupflHBBnxAfMVuclTy789gKMAo9hu27CsxcIR6JdBpgDGwj2i"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1381055193638113411/Ahn9eL4cH58xyknYXRVpuccrQr1Eh8gpeWzAPQLmq5wdbkIRffvvEE_lV04Wt6zyVcA7"
 
 local function waitForTeleport()
     local attempts = 0
