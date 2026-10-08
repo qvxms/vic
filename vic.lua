@@ -1,953 +1,941 @@
---// Server Hopper
-local players = game:GetService("Players")
-local httpService = game:GetService("HttpService")
-local userInput = game:GetService("UserInputService")
-local runService = game:GetService("RunService")
-local tweenService = game:GetService("TweenService")
-local teleportService = game:GetService("TeleportService")
-local localPlayer = players.LocalPlayer
+-- Server Hopper v0.2 · liquid glass
+local Players         = game:GetService("Players")
+local HttpService     = game:GetService("HttpService")
+local UIS             = game:GetService("UserInputService")
+local RunService      = game:GetService("RunService")
+local TweenService    = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local lp = Players.LocalPlayer
 
--- ============ FORWARD REFS (must exist before any function uses them) ============
-local U = {}
-local accentListeners = {}
-local chatLabelRef = nil   -- bound inside buildUI once the log label exists
+-- fully tear down any previous instance (connections + gui), not just the gui
+if _G.__hopper_unload then pcall(_G.__hopper_unload) end
 
-if _G.__hopper_loaded then
-    local pg = localPlayer:FindFirstChild("PlayerGui")
-    if pg then
-        local old = pg:FindFirstChild("hopper")
-        if old then old:Destroy() end
+local request = (syn and syn.request) or (http and http.request) or http_request or request
+
+local VERSION  = "v0.2 beta"
+local ICON     = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
+local FILE_BL  = "hopper_blacklist.json"
+local FILE_CFG = "hopper_config.json"
+local BL_TTL   = 6 * 3600        -- blacklist entries expire (servers are short-lived)
+local MAX_PAGES, WANT, MAX_RETRIES, MAX_ROWS = 15, 40, 4, 80
+
+local rgb, CSK, NSK = Color3.fromRGB, ColorSequenceKeypoint.new, NumberSequenceKeypoint.new
+local WHITE = rgb(255, 255, 255)
+local C = {
+    text = rgb(242, 244, 250), mid = rgb(168, 172, 188), dim = rgb(118, 122, 140),
+    green = rgb(130, 220, 165), yellow = rgb(240, 205, 120), red = rgb(240, 130, 140), blue = rgb(120, 170, 245),
+}
+
+-- ============ CORE STATE ============
+local connections, unloaded = {}, false
+local function track(c) connections[#connections + 1] = c return c end
+local function clamp(n, a, b) return math.max(a, math.min(b, n)) end
+local function debounce(fn, d)
+    local pending = false
+    return function()
+        if pending then return end
+        pending = true
+        task.delay(d, function() pending = false fn() end)
     end
-    _G.__hopper_loaded = false
-    _G.__hopper_unload = nil
 end
-_G.__hopper_loaded = true
 
-local http = (syn and syn.request) or (http and http.request) or http_request or request
-if not http then _G.__hopper_loaded = false warn("no http executor") return end
+local U = {}  -- ui refs
 
-local VERSION = "v0.1 beta"
-local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
-local blacklistFile = "hopper_blacklist.json"
-local configFile    = "hopper_config.json"
+-- ============ DISK ============
+local canFS = writefile and readfile and isfile
+local function readJSON(path)
+    if not canFS or not isfile(path) then return nil end
+    local ok, d = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    return ok and d or nil
+end
+local function writeJSON(path, data)
+    if canFS then pcall(writefile, path, HttpService:JSONEncode(data)) end
+end
 
--- ============ SESSION ============
-local sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+-- ============ LOGGING ============
+local sessionId = os.time() .. "_" .. math.random(1000, 9999)
 local sessionFile = "hopper_session_" .. sessionId .. ".log"
-local sessionLogs = {}
-local MAX_SESSION_LOGS = 200
+local logLines, logDirty, MAX_LOG = {}, false, 150
 
-local function diskAppend(path, line)
-    if not writefile or not readfile then return end
-    local ok, existing = pcall(function() return readfile(path) end)
-    local content = (ok and existing) or ""
-    local lines = {}
-    for l in content:gmatch("[^\n]+") do table.insert(lines, l) end
-    table.insert(lines, line)
-    while #lines > 2000 do table.remove(lines, 1) end
-    pcall(function() writefile(path, table.concat(lines, "\n")) end)
+local function esc(s)
+    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
 end
 
-local function sessionLog(prefix, speaker, text, color)
-    color = color or Color3.fromRGB(242, 244, 250)
-    local line = prefix .. speaker .. ": " .. text
-    table.insert(sessionLogs, line)
-    if #sessionLogs > MAX_SESSION_LOGS then table.remove(sessionLogs, 1) end
-    if speaker == "hopper" and (
-        text:find("^hopping") or text:find("selected") or text:find("landed") or
-        text:find("no fresh") or text:find("rerouted") or text:find("manual hop") or
-        text:find("scanning") or text:find("found %d+ candidates") or
-        text:find("giving up") or text:find("retry") or text:find("scanned")
-    ) then
-        diskAppend(sessionFile, "[" .. os.date("%H:%M:%S") .. "] " .. line)
-    end
-    if chatLabelRef then
-        local out = {}
-        for _, l in ipairs(sessionLogs) do table.insert(out, l) end
-        chatLabelRef.Text = table.concat(out, "\n")
+local function log(text, color, persist)
+    color = color or C.mid
+    logLines[#logLines + 1] = ('<font color="#%s">·  %s</font>'):format(color:ToHex(), esc(text))
+    if #logLines > MAX_LOG then table.remove(logLines, 1) end
+    logDirty = true
+    if persist and appendfile then
+        pcall(appendfile, sessionFile, ("[%s] %s\n"):format(os.date("%H:%M:%S"), text))
     end
 end
-
-local function log(text, color) sessionLog("·  ", "hopper", text, color or Color3.fromRGB(168, 172, 188)) end
-local function logInfo(text) log(text, Color3.fromRGB(120, 170, 245)) end
-local function logGood(text) log(text, Color3.fromRGB(130, 220, 165)) end
-local function logWarn(text) log(text, Color3.fromRGB(240, 205, 120)) end
-local function logBad(text) log(text, Color3.fromRGB(240, 130, 140)) end
+local function logInfo(t) log(t, C.blue, true) end
+local function logGood(t) log(t, C.green, true) end
+local function logWarn(t) log(t, C.yellow, true) end
+local function logBad(t)  log(t, C.red, true) end
 
 -- ============ CONFIG ============
-local config = {
-    maxPages = 15,
-    minPlayers = 1,
-    maxPlayerRatio = 1.0,
-    autoHopDelay = 3,
-    hopOnJoin = false,
-    preferLessFull = true,
-    skipEmpty = true,
-}
-
-local persistConfig = {
-    themeIdx = 1,
-    scale = 1,
-    preferLessFull = true,
-    skipEmpty = true,
-}
-
-local function loadConfigFromDisk()
-    if not readfile or not isfile then return end
-    if not isfile(configFile) then return end
-    local ok, data = pcall(function() return httpService:JSONDecode(readfile(configFile)) end)
-    if ok and type(data) == "table" then
-        if type(data.themeIdx) == "number" then persistConfig.themeIdx = data.themeIdx end
-        if type(data.scale) == "number" then persistConfig.scale = data.scale end
-        if type(data.preferLessFull) == "boolean" then persistConfig.preferLessFull = data.preferLessFull end
-        if type(data.skipEmpty) == "boolean" then persistConfig.skipEmpty = data.skipEmpty end
+local cfg = { themeIdx = 1, scale = 1, preferLessFull = true, skipEmpty = true, hopOnJoin = false }
+do
+    local d = readJSON(FILE_CFG)
+    if type(d) == "table" then
+        for k, v in pairs(cfg) do
+            if type(d[k]) == type(v) then cfg[k] = d[k] end
+        end
     end
 end
+local saveCfg = debounce(function() writeJSON(FILE_CFG, cfg) end, 0.4)
 
-local function saveConfigToDisk()
-    if not writefile then return end
-    pcall(function()
-        writefile(configFile, httpService:JSONEncode(persistConfig))
-    end)
-end
-
-loadConfigFromDisk()
-
-config.preferLessFull = persistConfig.preferLessFull
-config.skipEmpty = persistConfig.skipEmpty
-config.maxPlayerRatio = config.preferLessFull and 0.9 or 1.0
-config.minPlayers = config.skipEmpty and 1 or 0
-
+-- ============ BLACKLIST (id -> timestamp, auto-expiring) ============
 local blacklist = {}
-local sessionVisited = {}
-local expectedJobId = nil
-local hopAttempts = 0
-local MAX_AUTO_RETRIES = 4
-
-local connections = {}
-local unloaded = false
-local currentScale = persistConfig.scale or 1
-local targetScale = persistConfig.scale or 1
-local scaleVelocity = 0
-local currentThemeIdx = persistConfig.themeIdx or 1
-local hopping = false
-
-local function track(c) table.insert(connections, c) return c end
-local function clamp(n, a, b) return math.max(a, math.min(b, n)) end
-
-local function loadBlacklist()
-    if readfile and isfile and isfile(blacklistFile) then
-        local ok, data = pcall(function() return httpService:JSONDecode(readfile(blacklistFile)) end)
-        if ok and type(data) == "table" then
-            for _, id in ipairs(data) do blacklist[tostring(id)] = true end
+do
+    local d, now = readJSON(FILE_BL), os.time()
+    if type(d) == "table" then
+        for k, v in pairs(d) do
+            local id, t
+            if type(k) == "number" then id, t = tostring(v), now   -- legacy array format
+            else id, t = k, tonumber(v) or now end
+            if now - t < BL_TTL then blacklist[id] = t end
         end
     end
 end
-
-local function saveBlacklist()
-    if writefile then
-        local list = {}
-        for id in pairs(blacklist) do table.insert(list, id) end
-        pcall(function() writefile(blacklistFile, httpService:JSONEncode(list)) end)
-    end
+local function saveBL() writeJSON(FILE_BL, blacklist) end
+local function ban(id)
+    if id and id ~= "" then blacklist[id] = os.time() saveBL() end
 end
 
-loadBlacklist()
+local currentId = (game.JobId ~= "" and game.JobId) or nil
+ban(currentId)
 
-local function getCurrentServerId()
-    local jid = game.JobId
-    if jid and jid ~= "" then return tostring(jid) end
-    local ok, info = pcall(function() return teleportService:GetLocalPlayerTeleportData() end)
-    if ok and type(info) == "table" and info.JobId then return tostring(info.JobId) end
-    return nil
+local function shortId(id) id = tostring(id) return #id > 10 and id:sub(1, 10) or id end
+
+-- ============ THEMES / PALETTE ============
+local function T(name, c1, c2, c3, acc, hi, rainbow)
+    return { name = name, rainbow = rainbow, pal = { c1 = c1, c2 = c2, c3 = c3, acc = acc, hi = hi } }
 end
-
-local currentServerId = getCurrentServerId()
-if currentServerId then
-    blacklist[currentServerId] = true
-    sessionVisited[currentServerId] = true
-    saveBlacklist()
-end
-
-local function shortId(id)
-    id = tostring(id)
-    return #id > 10 and id:sub(1, 10) or id
-end
-
--- ============ UI FRAMEWORK ============
-
-local C = {
-    text     = Color3.fromRGB(242, 244, 250),
-    textMid  = Color3.fromRGB(168, 172, 188),
-    textDim  = Color3.fromRGB(118, 122, 140),
-    accent   = Color3.fromRGB(120, 170, 245),
-    accentHi = Color3.fromRGB(155, 200, 255),
-    green    = Color3.fromRGB(130, 220, 165),
-    yellow   = Color3.fromRGB(240, 205, 120),
-    red      = Color3.fromRGB(240, 130, 140),
-}
-
--- Theme list — rainbow is a normal entry
 local themes = {
-    {name="midnight", c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255)},
-    {name="emerald",  c1=Color3.fromRGB(36,100,90),  c2=Color3.fromRGB(18,40,42),  c3=Color3.fromRGB(45,80,75),   accent=Color3.fromRGB(105,200,155), accentHi=Color3.fromRGB(140,225,180)},
-    {name="crimson",  c1=Color3.fromRGB(130,45,55),  c2=Color3.fromRGB(45,20,28),  c3=Color3.fromRGB(100,40,75),  accent=Color3.fromRGB(220,110,120), accentHi=Color3.fromRGB(245,145,155)},
-    {name="sunset",   c1=Color3.fromRGB(140,70,45),  c2=Color3.fromRGB(60,32,40),  c3=Color3.fromRGB(120,55,90),  accent=Color3.fromRGB(230,160,90),  accentHi=Color3.fromRGB(250,190,120)},
-    {name="violet",   c1=Color3.fromRGB(95,55,155),  c2=Color3.fromRGB(38,25,65),  c3=Color3.fromRGB(120,55,130), accent=Color3.fromRGB(170,130,235), accentHi=Color3.fromRGB(195,160,255)},
-    {name="mono",     c1=Color3.fromRGB(75,75,82),   c2=Color3.fromRGB(38,38,42),  c3=Color3.fromRGB(58,58,65),   accent=Color3.fromRGB(180,185,200), accentHi=Color3.fromRGB(210,215,230)},
-    {name="rainbow",  c1=Color3.fromRGB(52,68,130),  c2=Color3.fromRGB(20,28,55),  c3=Color3.fromRGB(65,45,110),  accent=Color3.fromRGB(120,170,245), accentHi=Color3.fromRGB(155,200,255), rainbow=true},
+    T("midnight", rgb(52,68,130),  rgb(20,28,55), rgb(65,45,110),  rgb(120,170,245), rgb(155,200,255)),
+    T("emerald",  rgb(36,100,90),  rgb(18,40,42), rgb(45,80,75),   rgb(105,200,155), rgb(140,225,180)),
+    T("crimson",  rgb(130,45,55),  rgb(45,20,28), rgb(100,40,75),  rgb(220,110,120), rgb(245,145,155)),
+    T("sunset",   rgb(140,70,45),  rgb(60,32,40), rgb(120,55,90),  rgb(230,160,90),  rgb(250,190,120)),
+    T("violet",   rgb(95,55,155),  rgb(38,25,65), rgb(120,55,130), rgb(170,130,235), rgb(195,160,255)),
+    T("mono",     rgb(75,75,82),   rgb(38,38,42), rgb(58,58,65),   rgb(180,185,200), rgb(210,215,230)),
+    T("rainbow",  rgb(52,68,130),  rgb(20,28,55), rgb(65,45,110),  rgb(120,170,245), rgb(155,200,255), true),
 }
+if cfg.themeIdx < 1 or cfg.themeIdx > #themes then cfg.themeIdx = 1 end
+cfg.scale = clamp(cfg.scale, 0.7, 1.5)
 
-if currentThemeIdx < 1 or currentThemeIdx > #themes then
-    currentThemeIdx = 1
-    persistConfig.themeIdx = 1
+local function rainbowPal(h)
+    return {
+        c1 = Color3.fromHSV(h, .55, .55), c2 = Color3.fromHSV(h, .55, .22), c3 = Color3.fromHSV(h, .55, .45),
+        acc = Color3.fromHSV(h, .55, 1),  hi = Color3.fromHSV(h, .45, 1),
+    }
+end
+local function lerpPal(a, b, t)
+    return { c1 = a.c1:Lerp(b.c1, t), c2 = a.c2:Lerp(b.c2, t), c3 = a.c3:Lerp(b.c3, t),
+             acc = a.acc:Lerp(b.acc, t), hi = a.hi:Lerp(b.hi, t) }
 end
 
-local WIN_W, WIN_H = 460, 580
-local HEADER_H = 58
-local TABS_H = 36
+local pal = themes[cfg.themeIdx].pal
+local rainbowOn = themes[cfg.themeIdx].rainbow or false
+local hue, transitioning = 0, false
+local registry = {}   -- accent-bound objects: {obj, prop, kind}
+local function reg(obj, prop, kind) registry[#registry + 1] = { obj, prop, kind } end
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "hopper"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = localPlayer:WaitForChild("PlayerGui")
-
-local function registerAccent(obj, prop, use)
-    table.insert(accentListeners, {obj = obj, prop = prop, use = use})
-end
-
-local function lerpNumberSeq(a, b, t)
-    local out = {}
-    local kpsA, kpsB = a.Keypoints, b.Keypoints
-    local n = math.min(#kpsA, #kpsB)
-    for i = 1, n do
-        local ka, kb = kpsA[i], kpsB[i]
-        table.insert(out, NumberSequenceKeypoint.new(
-            ka.Time,
-            ka.Value + (kb.Value - ka.Value) * t,
-            ka.Envelope + (kb.Envelope - ka.Envelope) * t
-        ))
-    end
-    return NumberSequence.new(out)
-end
-
-local function lerpColorSeq(a, b, t)
-    local out = {}
-    local kpsA, kpsB = a.Keypoints, b.Keypoints
-    local n = math.min(#kpsA, #kpsB)
-    for i = 1, n do
-        local ka, kb = kpsA[i], kpsB[i]
-        table.insert(out, ColorSequenceKeypoint.new(ka.Time, ka.Value:Lerp(kb.Value, t)))
-    end
-    return ColorSequence.new(out)
-end
-
-local function tweenNumSeq(obj, target, dur)
-    task.spawn(function()
-        local startSeq = obj.Transparency
-        local steps = math.max(6, math.floor(dur * 40))
-        for i = 1, steps do
-            if unloaded or not obj.Parent then return end
-            local t = i / steps
-            local et = 1 - math.pow(1 - t, 3)
-            obj.Transparency = lerpNumberSeq(startSeq, target, et)
-            task.wait(dur / steps)
+local function paint(p)
+    pal = p
+    if U.bgGrad then U.bgGrad.Color = ColorSequence.new({ CSK(0, p.c1), CSK(.5, p.c2), CSK(1, p.c3) }) end
+    if U.orb1 then U.orb1.BackgroundColor3 = p.c1 U.orb2.BackgroundColor3 = p.c3 U.orb3.BackgroundColor3 = p.c2 end
+    for _, r in ipairs(registry) do
+        local o, prop, kind = r[1], r[2], r[3]
+        if o.Parent then
+            if kind == "grad" then o.Color = ColorSequence.new(p.hi, p.acc)
+            else o[prop] = (kind == "hi") and p.hi or p.acc end
         end
-        if not unloaded and obj.Parent then obj.Transparency = target end
-    end)
+    end
 end
 
-local function tweenColorSeq(obj, target, dur)
-    task.spawn(function()
-        local startSeq = obj.Color
-        local steps = math.max(8, math.floor(dur * 40))
-        for i = 1, steps do
-            if unloaded or not obj.Parent then return end
-            local t = i / steps
-            local et = 1 - math.pow(1 - t, 3)
-            obj.Color = lerpColorSeq(startSeq, target, et)
-            task.wait(dur / steps)
-        end
-        if not unloaded and obj.Parent then obj.Color = target end
-    end)
-end
-
+-- ============ UI HELPERS ============
 local function tw(o, p, t, style, dir)
-    if o:IsA("UIGradient") then
-        if p.Color ~= nil then tweenColorSeq(o, p.Color, t or 0.24) end
-        if p.Transparency ~= nil then tweenNumSeq(o, p.Transparency, t or 0.24) end
-        local rest = {}
-        for k, v in pairs(p) do
-            if k ~= "Color" and k ~= "Transparency" then rest[k] = v end
-        end
-        if next(rest) then
-            local t2 = tweenService:Create(o, TweenInfo.new(t or 0.24, style or Enum.EasingStyle.Quart, dir or Enum.EasingDirection.Out), rest)
-            t2:Play()
-            return t2
-        end
-        return nil
-    end
-    local t2 = tweenService:Create(o, TweenInfo.new(t or 0.24, style or Enum.EasingStyle.Quart, dir or Enum.EasingDirection.Out), p)
-    t2:Play()
-    return t2
+    local x = TweenService:Create(o, TweenInfo.new(t or .24, style or Enum.EasingStyle.Quart, dir or Enum.EasingDirection.Out), p)
+    x:Play()
+    return x
 end
+
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    if o:IsA("GuiObject") then o.BorderSizePixel = 0 end
+    if class == "TextButton" then o.AutoButtonColor = false end
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+local function grad(o, c, t, rot) return make("UIGradient", { Color = c, Transparency = t, Rotation = rot or 90 }, o) end
+local function stroke(o, th, tr, col) return make("UIStroke", { Thickness = th or 1, Transparency = tr or .55, Color = col or WHITE }, o) end
+
+local function text(parent, p)
+    local d = { BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.text,
+                TextXAlignment = Enum.TextXAlignment.Left }
+    for k, v in pairs(p) do d[k] = v end
+    return make("TextLabel", d, parent)
+end
+
+local function hover(o, on, off, s, sOn, sOff)
+    track(o.MouseEnter:Connect(function() tw(o, on, .18) if s then tw(s, sOn, .18) end end))
+    track(o.MouseLeave:Connect(function() tw(o, off, .22) if s then tw(s, sOff, .22) end end))
+end
+
+-- shared glass sequences (immutable, safe to reuse)
+local GL_C = ColorSequence.new({ CSK(0, WHITE), CSK(.6, rgb(230,232,240)), CSK(1, rgb(200,205,218)) })
+local GL_T = NumberSequence.new(0.86, 0.94)
+local ST_C = ColorSequence.new({ CSK(0, WHITE), CSK(.5, rgb(200,210,230)), CSK(1, rgb(140,148,168)) })
+local ST_T = NumberSequence.new({ NSK(0, .4), NSK(.5, .68), NSK(1, .85) })
+local SOFT_C = ColorSequence.new(WHITE, rgb(210, 215, 228))
+
+local function glass(parent, class, radius, order)
+    local btn = class == "TextButton"
+    local f = make(class, { BackgroundColor3 = WHITE, BackgroundTransparency = btn and .88 or .9,
+        LayoutOrder = order or 0, Text = btn and "" or nil }, parent)
+    corner(f, radius)
+    grad(f, GL_C, GL_T)
+    local s = make("UIStroke", { Color = WHITE, Thickness = 1 }, f)
+    grad(s, ST_C, ST_T)
+    if btn then hover(f, { BackgroundTransparency = .8 }, { BackgroundTransparency = .88 }, s, { Thickness = 1.5 }, { Thickness = 1 }) end
+    return f, s
+end
+
+local function solidButton(parent, txt, color, props, accent)
+    props.Text, props.Font, props.TextSize, props.TextColor3 = txt, Enum.Font.GothamBold, 11, WHITE
+    props.BackgroundColor3 = color
+    local b = make("TextButton", props, parent)
+    corner(b, 8)
+    local g = grad(b, ColorSequence.new(WHITE:Lerp(color, .5), color), NumberSequence.new(0))
+    stroke(b, 1, .55)
+    if accent then reg(b, "BackgroundColor3", "acc") reg(g, "Color", "grad") end
+    hover(b, { BackgroundTransparency = .1 }, { BackgroundTransparency = 0 })
+    return b
+end
+
+local function section(parent, txt, order)
+    local f = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = order }, parent)
+    make("UIPadding", { PaddingLeft = UDim.new(0, 4) }, f)
+    text(f, { Size = UDim2.fromScale(1, 1), Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = C.dim, Text = txt:upper() })
+end
+
+local function emptyCard(parent, txt)
+    local e = make("Frame", { BackgroundColor3 = WHITE, BackgroundTransparency = .93, Size = UDim2.new(1, 0, 0, 60) }, parent)
+    corner(e, 10) stroke(e, 1, .7)
+    text(e, { Size = UDim2.new(1, -24, 1, 0), Position = UDim2.new(0, 12, 0, 0), TextColor3 = C.mid, Text = txt })
+end
+
+local function counter() local n = 0 return function() n = n + 1 return n end end
 
 local function draggable(frame, handle)
-    handle = handle or frame
-    local drag, start, orig
-    track(handle.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            drag, start, orig = true, i.Position, frame.Position
-        end
-    end))
-    track(handle.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then drag = false end
-    end))
-    track(userInput.InputChanged:Connect(function(i)
-        if not drag then return end
-        if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+    local dragging, start, orig
+    local function isPtr(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
+    track(handle.InputBegan:Connect(function(i) if isPtr(i) then dragging, start, orig = true, i.Position, frame.Position end end))
+    track(handle.InputEnded:Connect(function(i) if isPtr(i) then dragging = false end end))
+    track(UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - start
             frame.Position = UDim2.new(orig.X.Scale, orig.X.Offset + d.X, orig.Y.Scale, orig.Y.Offset + d.Y)
         end
     end))
 end
 
-local function glassSurface(parent, order)
-    local f = Instance.new("Frame", parent)
-    f.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    f.BackgroundTransparency = 0.9
-    f.BorderSizePixel = 0
-    f.ZIndex = 5
-    if order then f.LayoutOrder = order end
-    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 12)
-    local grad = Instance.new("UIGradient", f)
-    grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
-        ColorSequenceKeypoint.new(0.6, Color3.fromRGB(230, 232, 240)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 205, 218)),
-    })
-    grad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.86),
-        NumberSequenceKeypoint.new(1, 0.94),
-    })
-    grad.Rotation = 90
-    local stroke = Instance.new("UIStroke", f)
-    stroke.Color = Color3.fromRGB(255, 255, 255)
-    stroke.Thickness = 1
-    local sg = Instance.new("UIGradient", stroke)
-    sg.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(200, 210, 230)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(140, 148, 168)),
-    })
-    sg.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.4),
-        NumberSequenceKeypoint.new(0.5, 0.68),
-        NumberSequenceKeypoint.new(1, 0.85),
-    })
-    sg.Rotation = 90
-    return f
-end
-
-local function glassButton(parent, height, order)
-    local b = Instance.new("TextButton", parent)
-    b.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    b.BackgroundTransparency = 0.88
-    b.BorderSizePixel = 0
-    b.Size = UDim2.new(1, 0, 0, height or 44)
-    b.Text = ""
-    b.AutoButtonColor = false
-    b.ZIndex = 5
-    if order then b.LayoutOrder = order end
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
-    local grad = Instance.new("UIGradient", b)
-    grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(210, 214, 226)),
-    })
-    grad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.85),
-        NumberSequenceKeypoint.new(1, 0.93),
-    })
-    grad.Rotation = 90
-    local stroke = Instance.new("UIStroke", b)
-    stroke.Color = Color3.fromRGB(255, 255, 255)
-    stroke.Thickness = 1
-    local sGrad = Instance.new("UIGradient", stroke)
-    sGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(150, 158, 178)),
-    })
-    sGrad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.5),
-        NumberSequenceKeypoint.new(1, 0.82),
-    })
-    sGrad.Rotation = 90
-    track(b.MouseEnter:Connect(function()
-        if b:GetAttribute("pressed") then return end
-        tweenNumSeq(grad, NumberSequence.new({NumberSequenceKeypoint.new(0, 0.78), NumberSequenceKeypoint.new(1, 0.88)}), 0.22)
-        tweenNumSeq(sGrad, NumberSequence.new({NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 0.7)}), 0.22)
-    end))
-    track(b.MouseLeave:Connect(function()
-        b:SetAttribute("pressed", false)
-        tweenNumSeq(grad, NumberSequence.new({NumberSequenceKeypoint.new(0, 0.85), NumberSequenceKeypoint.new(1, 0.93)}), 0.26)
-        tweenNumSeq(sGrad, NumberSequence.new({NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 0.82)}), 0.26)
-    end))
-    return b
-end
-
-local function applyTheme(idx, save)
-    if unloaded then return end
-    currentThemeIdx = idx
-    persistConfig.themeIdx = idx
-    if save then saveConfigToDisk() end
-    local t = themes[idx]
-
-    if not t.rainbow then
-        task.spawn(function()
-            local prev = themes[(idx - 2) % #themes + 1]
-            for s = 1, 24 do
-                if unloaded then break end
-                local p = s / 24
-                local ep = 1 - math.pow(1 - p, 3)
-                local c1 = prev.c1:Lerp(t.c1, ep)
-                local c2 = prev.c2:Lerp(t.c2, ep)
-                local c3 = prev.c3:Lerp(t.c3, ep)
-                if U.bgGrad then
-                    U.bgGrad.Color = ColorSequence.new({
-                        ColorSequenceKeypoint.new(0.0, c1),
-                        ColorSequenceKeypoint.new(0.5, c2),
-                        ColorSequenceKeypoint.new(1.0, c3),
-                    })
-                end
-                task.wait(0.03)
-            end
-        end)
-        if U.orb1 then tweenService:Create(U.orb1, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c1}):Play() end
-        if U.orb2 then tweenService:Create(U.orb2, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c3}):Play() end
-        if U.orb3 then tweenService:Create(U.orb3, TweenInfo.new(0.9, Enum.EasingStyle.Quart), {BackgroundColor3 = t.c2}):Play() end
-        for _, listener in ipairs(accentListeners) do
-            if listener.obj and listener.obj.Parent then
-                if listener.use == "grad" then
-                    tweenColorSeq(listener.obj, ColorSequence.new(t.accentHi, t.accent), 0.6)
-                else
-                    local target = (listener.use == "hi") and t.accentHi or t.accent
-                    tweenService:Create(listener.obj, TweenInfo.new(0.6, Enum.EasingStyle.Quart), {[listener.prop] = target}):Play()
-                end
-            end
-        end
-    end
-
-    if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
-end
-
--- Rainbow loop
-task.spawn(function()
-    local hue = 0
-    while not unloaded do
-        local dt = runService.RenderStepped:Wait()
-        if themes[currentThemeIdx].rainbow then
-            hue = (hue + dt * 0.08) % 1
-
-            if U.bgGrad then
-                local c1 = Color3.fromHSV(hue, 0.55, 0.55)
-                local c2 = Color3.fromHSV(hue, 0.55, 0.22)
-                local c3 = Color3.fromHSV(hue, 0.55, 0.45)
-                U.bgGrad.Color = ColorSequence.new({
-                    ColorSequenceKeypoint.new(0.0, c1),
-                    ColorSequenceKeypoint.new(0.5, c2),
-                    ColorSequenceKeypoint.new(1.0, c3),
-                })
-            end
-
-            if U.orb1 then U.orb1.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.5) end
-            if U.orb2 then U.orb2.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.45) end
-            if U.orb3 then U.orb3.BackgroundColor3 = Color3.fromHSV(hue, 0.55, 0.35) end
-
-            local acc1 = Color3.fromHSV(hue, 0.55, 1)
-            local acc2 = Color3.fromHSV(hue, 0.45, 1)
-            for _, listener in ipairs(accentListeners) do
-                if listener.obj and listener.obj.Parent then
-                    if listener.use == "grad" then
-                        listener.obj.Color = ColorSequence.new(acc2, acc1)
-                    else
-                        local target = (listener.use == "hi") and acc2 or acc1
-                        listener.obj[listener.prop] = target
-                    end
-                end
-            end
-        end
-    end
-end)
-
 local function setStatus(state, txt)
     if not U.statusDot then return end
-    local col = C.red
-    local label, lc = txt or "idle", C.textMid
-    if state == "ok" then col = C.green; label = txt or "ready"
-    elseif state == "loading" then col = C.yellow; label = txt or "scanning" end
-    tw(U.statusDot, {BackgroundColor3 = col}, 0.36, Enum.EasingStyle.Quart)
-    tw(U.statusText, {TextColor3 = lc}, 0.36, Enum.EasingStyle.Quart)
-    if U.statusRing then tw(U.statusRing, {Color = col}, 0.36, Enum.EasingStyle.Quart) end
-    U.statusText.Text = label
-    if U.pillDot then U.pillDot.BackgroundColor3 = col end
+    local col = (state == "ok" and C.green) or (state == "loading" and C.yellow) or C.red
+    U.statusText.Text = txt or ((state == "ok" and "ready") or (state == "loading" and "scanning") or "idle")
+    tw(U.statusDot, { BackgroundColor3 = col }, .36)
+    tw(U.statusRing, { Color = col }, .36)
+    U.pillDot.BackgroundColor3 = col
 end
 
--- ============ FETCH + HOP LOGIC ============
+-- ============ NETWORK + HOP LOGIC ============
+local function httpGet(url)
+    if request then
+        local ok, res = pcall(request, { Url = url, Method = "GET" })
+        if ok and res then return res.Body, res.StatusCode end
+    end
+    local ok, body = pcall(game.HttpGet, game, url)
+    if ok then return body, 200 end
+    return nil, nil
+end
 
 local function fetchPage(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100")
-        :format(game.PlaceId)
-    if cursor and cursor ~= "" then
-        url = url .. "&cursor=" .. cursor
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"):format(game.PlaceId)
+    if cursor then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
+    for attempt = 1, 3 do
+        if unloaded then return nil end
+        local body, status = httpGet(url)
+        if status == 429 then
+            task.wait(1.5 * attempt)           -- rate limited: back off
+        elseif body then
+            local ok, d = pcall(HttpService.JSONDecode, HttpService, body)
+            if ok and type(d) == "table" and type(d.data) == "table" then return d end
+            return nil
+        else
+            return nil
+        end
     end
-    local body
-    local ok, res = pcall(function()
-        return http({Url = url, Method = "GET"})
+    return nil
+end
+
+local function usable(s)
+    if s.id == currentId or blacklist[s.id] then return false end
+    if s.maxPlayers <= 0 or s.playing >= s.maxPlayers then return false end
+    if s.playing < (cfg.skipEmpty and 1 or 0) then return false end
+    return s.playing / s.maxPlayers <= (cfg.preferLessFull and 0.9 or 1)
+end
+
+-- single scanner. stopAt = stop early once that many usable servers were found
+local function scan(onPage, stopAt)
+    local all, good, cursor = {}, 0, nil
+    for page = 1, MAX_PAGES do
+        if unloaded then break end
+        local d = fetchPage(cursor)
+        if not d then break end
+        for _, s in ipairs(d.data) do
+            local e = { id = tostring(s.id), playing = s.playing or 0, maxPlayers = s.maxPlayers or 0, ping = s.ping }
+            all[#all + 1] = e
+            if usable(e) then good = good + 1 end
+        end
+        if onPage then onPage(page, #all) end
+        cursor = d.nextPageCursor
+        if not cursor or cursor == "" or (stopAt and good >= stopAt) then break end
+        task.wait(0.12)
+    end
+    return all, good
+end
+
+local scanCache = { t = 0, list = {}, full = false }
+local hopping, hopToken, failStreak, lastForced, scanning = false, 0, 0, false, false
+
+local function release(token)
+    if token == hopToken then hopping = false setStatus("ok", "ready") end
+end
+
+local function teleportTo(id)
+    ban(currentId)
+    local ok = pcall(function()
+        local o = Instance.new("TeleportOptions")
+        o.ServerInstanceId = id
+        TeleportService:TeleportAsync(game.PlaceId, { lp }, o)
     end)
-    if ok and res and res.Body then body = res.Body end
-    if not body then
-        local ok2, res2 = pcall(game.HttpGet, game, url)
-        if ok2 then body = res2 end
+    if not ok then
+        logWarn("teleportAsync failed — falling back")
+        ok = pcall(TeleportService.TeleportToPlaceInstance, TeleportService, game.PlaceId, id, lp)
     end
-    if not body then return nil end
-    local ok3, decoded = pcall(function() return httpService:JSONDecode(body) end)
-    return ok3 and decoded or nil
+    return ok
 end
 
-local function scanAllServers(progressCb)
-    local all = {}
-    local cursor = nil
-    for page = 1, config.maxPages do
-        local data = fetchPage(cursor)
-        if not data or not data.data then break end
-        for _, s in ipairs(data.data) do
-            table.insert(all, {
-                id = tostring(s.id),
-                playing = s.playing,
-                maxPlayers = s.maxPlayers,
-                ping = s.ping,
-                fps = s.fps,
-            })
-        end
-        if progressCb then progressCb(page, #all) end
-        cursor = data.nextPageCursor
-        if not cursor or cursor == "" then break end
+local function pickCandidate()
+    local age = os.clock() - scanCache.t
+    local list = scanCache.list
+    if age > 20 or #list == 0 then
+        setStatus("loading", "scanning")
+        logInfo("scanning for open servers...")
+        local good
+        list, good = scan(nil, WANT)
+        scanCache = { t = os.clock(), list = list, full = false }
+        logInfo(("scanned %d servers · %d usable"):format(#list, good))
     end
-    return all
+    local cands = {}
+    for _, s in ipairs(list) do if usable(s) then cands[#cands + 1] = s end end
+    if #cands == 0 then return nil end
+    table.sort(cands, function(a, b)
+        if a.playing ~= b.playing then return a.playing > b.playing end
+        return a.id < b.id
+    end)
+    return cands[math.random(1, math.max(1, math.floor(#cands / 3)))]
 end
 
-local function scanServers()
-    logInfo("scanning for open servers...")
-
-    local candidates = {}
-    local cursor = nil
-    local totalScanned = 0
-    local skippedBlacklist = 0
-    local skippedFull = 0
-
-    for page = 1, config.maxPages do
-        local data = fetchPage(cursor)
-        if not data or not data.data then break end
-
-        for _, s in ipairs(data.data) do
-            totalScanned = totalScanned + 1
-            local id = tostring(s.id)
-
-            if id == currentServerId or blacklist[id] or sessionVisited[id] then
-                skippedBlacklist = skippedBlacklist + 1
-            elseif s.playing >= s.maxPlayers then
-                skippedFull = skippedFull + 1
-            elseif s.playing < config.minPlayers then
-                -- too empty
-            elseif s.playing >= (s.maxPlayers - 1) and config.maxPlayerRatio < 1.0 then
-                skippedFull = skippedFull + 1
-            else
-                table.insert(candidates, s)
+local function doHop(forcedId)
+    if hopping then return end
+    hopping, lastForced = true, forcedId ~= nil
+    hopToken = hopToken + 1
+    local token = hopToken
+    setStatus("loading", "scanning")
+    task.spawn(function()
+        local target = forcedId
+        if not target then
+            for attempt = 1, MAX_RETRIES + 1 do
+                local c = pickCandidate()
+                if c then
+                    target = c.id
+                    logGood(("selected %s (%d/%d)"):format(shortId(c.id), c.playing, c.maxPlayers))
+                    break
+                end
+                if attempt > MAX_RETRIES then break end
+                logWarn(("no fresh servers — retry %d/%d in 3s"):format(attempt, MAX_RETRIES))
+                task.wait(3)
+                scanCache.t = 0
             end
+            if not target then logBad("giving up — no fresh servers") release(token) return end
         end
+        setStatus("loading", "hopping")
+        task.wait(0.3)
+        if not teleportTo(target) then
+            logBad("teleport call failed")
+            ban(target)
+            release(token)
+            return
+        end
+        task.delay(15, function() release(token) end)   -- watchdog if teleport silently stalls
+    end)
+end
 
-        cursor = data.nextPageCursor
-        if not cursor or cursor == "" then break end
-    end
-
-    log("scanned " .. totalScanned .. " servers")
-    log("skipped " .. skippedBlacklist .. " blacklisted, " .. skippedFull .. " full")
-    if #candidates > 0 then
-        logGood("found " .. #candidates .. " candidates")
+-- teleport rejected (full / dead server): ban it and try another
+track(TeleportService.TeleportInitFailed:Connect(function(plr, result, msg)
+    if plr ~= lp then return end
+    logWarn("teleport failed: " .. tostring(result))
+    local wasForced = lastForced
+    hopping = false
+    setStatus("ok", "ready")
+    if wasForced then return end
+    failStreak = failStreak + 1
+    if failStreak <= MAX_RETRIES then
+        task.delay(1, function() if not unloaded then doHop() end end)
     else
-        logBad("no fresh servers available")
+        failStreak = 0
+        logBad("giving up after repeated teleport failures")
     end
-    return candidates
+end))
+
+-- ============ SERVER LIST RENDER ============
+local renderToken = 0
+local function cmpServers(a, b)
+    local aBad = (a.id == currentId) or (blacklist[a.id] ~= nil)
+    local bBad = (b.id == currentId) or (blacklist[b.id] ~= nil)
+    if aBad ~= bBad then return not aBad end
+    if a.playing ~= b.playing then return a.playing > b.playing end
+    return a.id < b.id
+end
+
+local function makeServerRow(frame, s, order)
+    local isCur = s.id == currentId
+    local isBad = blacklist[s.id] ~= nil
+    local isFull = s.playing >= s.maxPlayers
+    local row = make("TextButton", { BackgroundColor3 = WHITE, BackgroundTransparency = isCur and .78 or .9,
+        Size = UDim2.new(1, 0, 0, 38), Text = "", LayoutOrder = order }, frame)
+    corner(row, 10)
+    grad(row, isCur and ColorSequence.new(rgb(140,180,240), rgb(80,120,190)) or SOFT_C,
+        NumberSequence.new(0.88, 0.95))
+    stroke(row, 1, .65)
+    local dot = make("Frame", { Size = UDim2.fromOffset(7, 7), Position = UDim2.new(0, 14, .5, -3),
+        BackgroundColor3 = (isCur and C.green) or (isBad and C.red) or (isFull and C.yellow) or C.blue }, row)
+    corner(dot, 4)
+    text(row, { Size = UDim2.new(1, -180, 1, 0), Position = UDim2.new(0, 28, 0, 0), Font = Enum.Font.Code, TextSize = 10,
+        TextTruncate = Enum.TextTruncate.AtEnd, Text = s.id })
+    text(row, { Size = UDim2.new(0, 90, 1, 0), Position = UDim2.new(1, -96, 0, 0), Font = Enum.Font.Code, TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = isFull and C.yellow or (isCur and C.green or C.mid),
+        Text = s.playing .. "/" .. s.maxPlayers .. ((s.ping and s.ping > 0) and ("  " .. s.ping .. "ms") or "") })
+    -- rows are destroyed on re-render so their connections die with them (no track needed)
+    row.MouseEnter:Connect(function() tw(row, { BackgroundTransparency = isCur and .7 or .82 }, .16) end)
+    row.MouseLeave:Connect(function() tw(row, { BackgroundTransparency = isCur and .78 or .9 }, .2) end)
+    row.MouseButton1Click:Connect(function()
+        if hopping then return end
+        if isCur then logWarn("already in that server") return end
+        logInfo("manual jump to " .. shortId(s.id))
+        failStreak = 0
+        doHop(s.id)
+    end)
 end
 
 function U.renderServerList(list)
-    if not U.serverListFrame then return end
-    for _, c in ipairs(U.serverListFrame:GetChildren()) do
-        if not c:IsA("UIListLayout") then c:Destroy() end
+    local frame = U.serverListFrame
+    if not frame then return end
+    renderToken = renderToken + 1
+    local token = renderToken
+    for _, c in ipairs(frame:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end
+    if #list == 0 then emptyCard(frame, "no servers found — hit refresh") return end
+    local rows = table.move(list, 1, #list, 1, {})
+    table.sort(rows, cmpServers)
+    for i = 1, math.min(#rows, MAX_ROWS) do
+        if token ~= renderToken or unloaded then return end
+        makeServerRow(frame, rows[i], i)
+        if i % 20 == 0 then task.wait() end     -- keep frames smooth while building
     end
-    if not list or #list == 0 then
-        local empty = Instance.new("Frame", U.serverListFrame)
-        empty.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        empty.BackgroundTransparency = 0.93
-        empty.BorderSizePixel = 0
-        empty.Size = UDim2.new(1, 0, 0, 60)
-        empty.LayoutOrder = 1
-        empty.ZIndex = 6
-        Instance.new("UICorner", empty).CornerRadius = UDim.new(0, 10)
-        local st = Instance.new("UIStroke", empty)
-        st.Color = Color3.fromRGB(255, 255, 255)
-        st.Thickness = 1
-        st.Transparency = 0.7
-        local lbl = Instance.new("TextLabel", empty)
-        lbl.BackgroundTransparency = 1
-        lbl.Size = UDim2.new(1, -24, 1, 0)
-        lbl.Position = UDim2.new(0, 12, 0, 0)
-        lbl.Font = Enum.Font.Gotham
-        lbl.TextSize = 11
-        lbl.TextColor3 = C.textMid
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Text = "click refresh to scan servers"
-        lbl.ZIndex = 7
-        return
-    end
-
-    table.sort(list, function(a, b)
-        local aBad = (blacklist[a.id] or a.id == currentServerId or sessionVisited[a.id])
-        local bBad = (blacklist[b.id] or b.id == currentServerId or sessionVisited[b.id])
-        if aBad ~= bBad then return not aBad end
-        local aFull = a.playing >= a.maxPlayers
-        local bFull = b.playing >= b.maxPlayers
-        if aFull ~= bFull then return not aFull end
-        return a.playing > b.playing
-    end)
-
-    for i, s in ipairs(list) do
-        local isCurrent = (s.id == currentServerId)
-        local isBlacklisted = blacklist[s.id] or sessionVisited[s.id]
-        local isFull = s.playing >= s.maxPlayers
-
-        local row = Instance.new("TextButton", U.serverListFrame)
-        row.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        row.BackgroundTransparency = isCurrent and 0.78 or 0.9
-        row.BorderSizePixel = 0
-        row.Size = UDim2.new(1, 0, 0, 38)
-        row.Text = ""
-        row.AutoButtonColor = false
-        row.LayoutOrder = i
-        row.ZIndex = 6
-        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
-        local rGrad = Instance.new("UIGradient", row)
-        rGrad.Color = isCurrent and
-            ColorSequence.new(Color3.fromRGB(140, 180, 240), Color3.fromRGB(80, 120, 190)) or
-            ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(210, 215, 228))
-        rGrad.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.88), NumberSequenceKeypoint.new(1, 0.95)})
-        rGrad.Rotation = 90
-        local rStroke = Instance.new("UIStroke", row)
-        rStroke.Color = Color3.fromRGB(255, 255, 255)
-        rStroke.Thickness = 1
-        rStroke.Transparency = 0.65
-
-        local dot = Instance.new("Frame", row)
-        dot.Size = UDim2.new(0, 7, 0, 7)
-        dot.Position = UDim2.new(0, 14, 0.5, -3)
-        dot.BorderSizePixel = 0
-        dot.ZIndex = 7
-        if isCurrent then
-            dot.BackgroundColor3 = Color3.fromRGB(130, 220, 165)
-        elseif isBlacklisted then
-            dot.BackgroundColor3 = Color3.fromRGB(240, 130, 140)
-        elseif isFull then
-            dot.BackgroundColor3 = Color3.fromRGB(240, 205, 120)
-        else
-            dot.BackgroundColor3 = Color3.fromRGB(120, 170, 245)
-        end
-        Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
-
-        local idLbl = Instance.new("TextLabel", row)
-        idLbl.BackgroundTransparency = 1
-        idLbl.Size = UDim2.new(1, -180, 1, 0)
-        idLbl.Position = UDim2.new(0, 28, 0, 0)
-        idLbl.Font = Enum.Font.Code
-        idLbl.TextSize = 10
-        idLbl.TextColor3 = C.text
-        idLbl.TextXAlignment = Enum.TextXAlignment.Left
-        idLbl.TextTruncate = Enum.TextTruncate.AtEnd
-        idLbl.Text = s.id
-        idLbl.ZIndex = 7
-
-        local countLbl = Instance.new("TextLabel", row)
-        countLbl.BackgroundTransparency = 1
-        countLbl.Size = UDim2.new(0, 90, 1, 0)
-        countLbl.Position = UDim2.new(1, -96, 0, 0)
-        countLbl.Font = Enum.Font.Code
-        countLbl.TextSize = 10
-        countLbl.TextColor3 = isFull and C.yellow or (isCurrent and C.green or C.textMid)
-        countLbl.TextXAlignment = Enum.TextXAlignment.Right
-        countLbl.Text = s.playing .. "/" .. s.maxPlayers ..
-            (s.ping and s.ping > 0 and ("  " .. s.ping .. "ms") or "")
-        countLbl.ZIndex = 7
-
-        track(row.MouseButton1Click:Connect(function()
-            if hopping then return end
-            if isCurrent then logWarn("already in that server") return end
-            hopping = true
-            setStatus("loading", "hopping")
-            logInfo("manual jump to " .. shortId(s.id))
-            if currentServerId then
-                blacklist[currentServerId] = true
-                sessionVisited[currentServerId] = true
-                saveBlacklist()
-            end
-            expectedJobId = tostring(s.id)
-            task.wait(0.5)
-            local ok = pcall(function()
-                local opts = Instance.new("TeleportOptions")
-                opts.ServerInstanceId = tostring(s.id)
-                opts.ShouldReserveServer = false
-                teleportService:TeleportAsync(game.PlaceId, {localPlayer}, opts)
-            end)
-            if not ok then
-                pcall(function()
-                    teleportService:TeleportToPlaceInstance(game.PlaceId, tostring(s.id), localPlayer)
-                end)
-            end
-            task.delay(12, function() hopping = false end)
-        end))
+    if #rows > MAX_ROWS and token == renderToken then
+        local f = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = MAX_ROWS + 1 }, frame)
+        text(f, { Size = UDim2.fromScale(1, 1), TextColor3 = C.dim, TextSize = 10, Text = ("+%d more not shown"):format(#rows - MAX_ROWS) })
     end
 end
 
-function U.refreshServerScan()
-    if U.scanInProgress then return end
-    U.scanInProgress = true
+function U.refreshServerScan(force)
+    if scanning then return end
+    if not force and scanCache.full and os.clock() - scanCache.t < 60 then
+        U.renderServerList(scanCache.list)
+        return
+    end
+    scanning = true
     setStatus("loading", "scanning")
     logInfo("scanning all servers...")
     task.spawn(function()
-        local all = scanAllServers(function(page, count)
-            if U.serverListStatus then
-                U.serverListStatus.Text = "page " .. page .. " · " .. count .. " servers"
-            end
+        local list = scan(function(p, n)
+            if U.serverStatus and not unloaded then U.serverStatus.Text = ("page %d · %d servers"):format(p, n) end
         end)
-        logGood("scan complete: " .. #all .. " servers")
-        U.renderServerList(all)
-        if U.serverListStatus then
-            U.serverListStatus.Text = #all .. " servers · " .. (currentServerId and shortId(currentServerId) or "?")
-        end
-        U.scanInProgress = false
-        setStatus("ok", "ready")
-    end)
-end
-
-local function doHop()
-    if hopping then return end
-    hopping = true
-    setStatus("loading", "scanning")
-    logInfo("hopping — session " .. sessionId)
-
-    task.spawn(function()
-        local candidates = scanServers()
-
-        if #candidates == 0 then
-            hopAttempts = hopAttempts + 1
-            if hopAttempts > MAX_AUTO_RETRIES then
-                logBad("giving up after " .. MAX_AUTO_RETRIES .. " failed attempts")
-                hopping = false
-                setStatus("ok", "ready")
-                return
-            end
-            logWarn("no candidates — retry " .. hopAttempts .. "/" .. MAX_AUTO_RETRIES .. " in 3s")
-            task.wait(3)
-            candidates = scanServers()
-            if #candidates == 0 then
-                logBad("still no fresh servers")
-                hopping = false
-                setStatus("ok", "ready")
-                return
-            end
-        end
-
-        table.sort(candidates, function(a, b) return a.playing > b.playing end)
-        local poolSize = math.max(1, math.floor(#candidates / 3))
-        local chosen = candidates[math.random(1, poolSize)]
-
-        logGood("selected " .. shortId(chosen.id) .. " (" .. chosen.playing .. "/" .. chosen.maxPlayers .. ")")
-
-        if currentServerId then
-            blacklist[currentServerId] = true
-            sessionVisited[currentServerId] = true
-            saveBlacklist()
-        end
-
-        expectedJobId = tostring(chosen.id)
-        task.wait(0.7)
-
-        local ok = pcall(function()
-            local opts = Instance.new("TeleportOptions")
-            opts.ServerInstanceId = tostring(chosen.id)
-            opts.ShouldReserveServer = false
-            teleportService:TeleportAsync(game.PlaceId, {localPlayer}, opts)
-        end)
-
-        if not ok then
-            logWarn("teleportAsync failed — falling back")
-            pcall(function()
-                teleportService:TeleportToPlaceInstance(game.PlaceId, tostring(chosen.id), localPlayer)
-            end)
-        end
-
-        task.delay(12, function() hopping = false end)
+        scanCache = { t = os.clock(), list = list, full = true }
+        scanning = false
+        if unloaded then return end
+        logGood("scan complete: " .. #list .. " servers")
+        U.renderServerList(list)
+        U.serverStatus.Text = #list .. " servers · " .. (currentId and shortId(currentId) or "?")
+        if not hopping then setStatus("ok", "ready") end
     end)
 end
 
 -- ============ BUILD UI ============
+local WIN_W, WIN_H, HEADER_H, TABS_H = 460, 580, 58, 36
+local gui = make("ScreenGui", { Name = "hopper", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, nil)
+gui.Parent = lp:WaitForChild("PlayerGui")
 
-local function buildUI()
-    local container = Instance.new("Frame", gui)
-    container.BackgroundTransparency = 1
-    container.Size = UDim2.new(0, WIN_W, 0, WIN_H)
-    container.Position = UDim2.new(0, 40, 0.5, 0)
-    container.AnchorPoint = Vector2.new(0, 0.5)
-    container.ZIndex = 1
+-- theme switching: one NumberValue drives a single lerp (replaces dozens of manual tween loops)
+local alpha = Instance.new("NumberValue")
+local fromPal, toPal, themeTween
+track(alpha:GetPropertyChangedSignal("Value"):Connect(function()
+    if toPal then paint(lerpPal(fromPal, toPal, alpha.Value)) end
+end))
+
+local function setTheme(idx, save)
+    if unloaded then return end
+    cfg.themeIdx = idx
+    if save then saveCfg() end
+    local t = themes[idx]
+    rainbowOn = t.rainbow or false
+    fromPal, toPal = pal, (t.rainbow and rainbowPal(hue)) or t.pal
+    if themeTween then themeTween:Cancel() end
+    alpha.Value = 0
+    transitioning = true
+    local mine = tw(alpha, { Value = 1 }, .7)
+    themeTween = mine
+    track(mine.Completed:Connect(function() if themeTween == mine then transitioning = false end end))
+    if U.themeLabel then U.themeLabel.Text = "theme · " .. t.name end
+end
+
+local function build()
+    local container = make("Frame", { BackgroundTransparency = 1, Size = UDim2.fromOffset(WIN_W, WIN_H),
+        Position = UDim2.new(0, 40, .5, 0), AnchorPoint = Vector2.new(0, .5) }, gui)
     U.container = container
-    local containerScale = Instance.new("UIScale", container)
-    containerScale.Scale = currentScale
-    U.containerScale = containerScale
+    local uiScale = make("UIScale", { Scale = cfg.scale }, container)
 
-    track(runService.RenderStepped:Connect(function(dt)
-        if unloaded then return end
-        if dt > 0.1 then dt = 0.1 end
-        local diff = targetScale - currentScale
-        local still = math.abs(diff) < 0.0005 and math.abs(scaleVelocity) < 0.0005
-        if not still then
-            local spring = 220
-            local damp = 14
-            scaleVelocity = scaleVelocity + (diff * spring - scaleVelocity * damp) * dt
-            currentScale = currentScale + scaleVelocity * dt
-            containerScale.Scale = currentScale
-        elseif currentScale ~= targetScale then
-            currentScale = targetScale
-            containerScale.Scale = currentScale
-            scaleVelocity = 0
+    local win = make("Frame", { BackgroundColor3 = rgb(14, 14, 20), Size = UDim2.fromScale(1, 1), Active = true,
+        ClipsDescendants = true }, container)
+    corner(win, 16)
+    local wst = make("UIStroke", { Color = WHITE, Thickness = 1 }, win)
+    grad(wst, ColorSequence.new(WHITE, rgb(140, 148, 168)), NumberSequence.new(0.5, 0.88))
+
+    -- background layer
+    local bg = make("Frame", { BackgroundColor3 = rgb(14, 14, 20), Size = UDim2.fromScale(1, 1), ZIndex = 0,
+        ClipsDescendants = true }, win)
+    corner(bg, 16)
+    U.bgGrad = make("UIGradient", {
+        Color = ColorSequence.new({ CSK(0, pal.c1), CSK(.5, pal.c2), CSK(1, pal.c3) }), Rotation = 35,
+        Transparency = NumberSequence.new({ NSK(0, .4), NSK(.5, .62), NSK(1, .4) }) }, bg)
+    corner(make("Frame", { BackgroundColor3 = rgb(10, 10, 14), BackgroundTransparency = .6,
+        Size = UDim2.fromScale(1, 1), ZIndex = 1 }, bg), 16)
+
+    -- orbs: native looping tweens (no per-orb coroutine, zero Lua cost per frame)
+    local function orb(color, size, p0, p1, dur, trans)
+        local o = make("Frame", { BackgroundColor3 = color, BackgroundTransparency = trans, Size = UDim2.fromOffset(size, size),
+            Position = p0, ZIndex = 2 }, bg)
+        corner(o, size)
+        TweenService:Create(o, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+            { Position = p1, BackgroundTransparency = trans - .1 }):Play()
+        return o
+    end
+    U.orb1 = orb(pal.c1, 320, UDim2.new(-.35, 0, -.2, 0), UDim2.new(.55, 0, .3, 0), 16, .72)
+    U.orb2 = orb(pal.c3, 280, UDim2.new(.7, 0, .5, 0),   UDim2.new(.15, 0, .95, 0), 20, .78)
+    U.orb3 = orb(pal.c2, 240, UDim2.new(.3, 0, .7, 0),   UDim2.new(.75, 0, -.05, 0), 24, .82)
+
+    -- ===== header =====
+    local header = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, HEADER_H) }, win)
+    draggable(container, header)
+
+    local iconBox = glass(header, "Frame", 9)
+    iconBox.Size, iconBox.Position = UDim2.fromOffset(34, 34), UDim2.fromOffset(16, 12)
+    corner(make("ImageLabel", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Image = ICON }, iconBox), 9)
+    text(header, { Size = UDim2.fromOffset(150, 16), Position = UDim2.fromOffset(62, 12), Font = Enum.Font.GothamBold,
+        TextSize = 14, Text = "server hopper" })
+    text(header, { Size = UDim2.fromOffset(150, 12), Position = UDim2.fromOffset(62, 29), TextSize = 10,
+        TextColor3 = C.dim, Text = "session " .. sessionId })
+
+    U.statusText = text(header, { Size = UDim2.new(0, 70, 1, 0), Position = UDim2.new(1, -162, 0, 0), Font = Enum.Font.GothamMedium,
+        TextColor3 = C.mid, TextXAlignment = Enum.TextXAlignment.Right, Text = "idle" })
+    U.statusDot = make("Frame", { BackgroundColor3 = C.red, Size = UDim2.fromOffset(7, 7), Position = UDim2.new(1, -84, .5, -3) }, header)
+    corner(U.statusDot, 4)
+    U.statusRing = stroke(U.statusDot, 1, .6, C.red)
+
+    local function iconBtn(txt, x)
+        local b = make("TextButton", { BackgroundColor3 = WHITE, BackgroundTransparency = .85, Size = UDim2.fromOffset(24, 24),
+            Position = UDim2.new(1, x, .5, -12), Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = C.mid, Text = txt }, header)
+        corner(b, 7) grad(b, SOFT_C, NumberSequence.new(0)) stroke(b, 1, .55)
+        return b
+    end
+    local btnMin, btnClose = iconBtn("−", -68), iconBtn("×", -40)
+    hover(btnClose, { BackgroundColor3 = rgb(200, 70, 85), BackgroundTransparency = .15, TextColor3 = rgb(255, 240, 245) },
+        { BackgroundColor3 = WHITE, BackgroundTransparency = .85, TextColor3 = C.mid })
+    hover(btnMin, { BackgroundTransparency = .7, TextColor3 = C.text }, { BackgroundTransparency = .85, TextColor3 = C.mid })
+
+    -- ===== tabs =====
+    local tabsBar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, TABS_H), Position = UDim2.fromOffset(0, HEADER_H) }, win)
+    local content = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -HEADER_H - TABS_H),
+        Position = UDim2.fromOffset(0, HEADER_H + TABS_H), ClipsDescendants = true }, win)
+
+    local tabNames = { "logs", "servers", "config", "blacklist" }
+    local tabBtns, pages, active = {}, {}, "logs"
+    for i, name in ipairs(tabNames) do
+        tabBtns[name] = make("TextButton", { BackgroundTransparency = 1, Size = UDim2.new(1 / #tabNames, 0, 1, 0),
+            Position = UDim2.new((i - 1) / #tabNames, 0, 0, 0), Font = Enum.Font.GothamMedium, TextSize = 12,
+            TextColor3 = name == active and C.text or C.dim, Text = name }, tabsBar)
+        pages[name] = make("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = name == active }, content)
+    end
+    local underline = make("Frame", { BackgroundColor3 = WHITE, BackgroundTransparency = .3, Size = UDim2.new(1 / #tabNames, -80, 0, 3),
+        Position = UDim2.new(0, 40, 1, -4), ZIndex = 7 }, tabsBar)
+    corner(underline, 2)
+    local ug = grad(underline, ColorSequence.new(pal.hi, pal.acc), NumberSequence.new({ NSK(0, .6), NSK(.5, 0), NSK(1, .6) }), 0)
+    reg(ug, "Color", "grad")
+
+    local function switchTab(name)
+        if name == active then return end
+        active = name
+        for n, p in pairs(pages) do p.Visible = n == name end
+        local veil = make("Frame", { BackgroundColor3 = rgb(10, 10, 14), BackgroundTransparency = .5, Size = UDim2.fromScale(1, 1), ZIndex = 70 }, pages[name])
+        tw(veil, { BackgroundTransparency = 1 }, .32)
+        task.delay(.34, function() veil:Destroy() end)
+        tw(underline, { Position = UDim2.new((table.find(tabNames, name) - 1) / #tabNames, 40, 1, -4) }, .4)
+        for n, b in pairs(tabBtns) do tw(b, { TextColor3 = n == name and C.text or C.dim }, .24) end
+        if name == "servers" then U.refreshServerScan()
+        elseif name == "blacklist" then U.refreshBlacklist() end
+    end
+    for n, b in pairs(tabBtns) do
+        track(b.MouseButton1Click:Connect(function() switchTab(n) end))
+        underline.Position = UDim2.new((table.find(tabNames, active) - 1) / #tabNames, 40, 1, -4)
+    end
+
+    local function scrollPage(page)
+        make("UIPadding", { PaddingTop = UDim.new(0, 14), PaddingBottom = UDim.new(0, 18), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, page)
+        local s = make("ScrollingFrame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2, ScrollBarImageColor3 = WHITE, ScrollBarImageTransparency = .7 }, page)
+        make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, s)
+        return s
+    end
+
+    -- ===== LOGS =====
+    U.logsPage = pages.logs
+    local chatCard = glass(pages.logs, "Frame", 12)
+    chatCard.Size, chatCard.Position = UDim2.new(1, -28, 1, -104), UDim2.fromOffset(14, 14)
+    local logScroll = make("ScrollingFrame", { BackgroundTransparency = 1, Size = UDim2.new(1, -28, 1, -28), Position = UDim2.fromOffset(14, 14),
+        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2,
+        ScrollBarImageColor3 = WHITE, ScrollBarImageTransparency = .7 }, chatCard)
+    U.logLabel = text(logScroll, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code,
+        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, LineHeight = 1.45, RichText = true, Text = "" })
+    -- autoscroll to newest line
+    track(logScroll:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+        logScroll.CanvasPosition = Vector2.new(0, math.max(0, logScroll.AbsoluteCanvasSize.Y - logScroll.AbsoluteSize.Y))
+    end))
+    logDirty = true
+
+    local inputBar = glass(pages.logs, "Frame", 12)
+    inputBar.Size, inputBar.Position = UDim2.new(1, -28, 0, 70), UDim2.new(0, 14, 1, -84)
+    text(inputBar, { Size = UDim2.new(1, -28, 0, 14), Position = UDim2.fromOffset(14, 10), Font = Enum.Font.GothamBold, TextSize = 10,
+        TextColor3 = C.dim, Text = "HOP CONTROL" })
+    local hopBtn = solidButton(inputBar, "hop now", pal.acc, { Size = UDim2.new(.55, -16, 0, 32), Position = UDim2.fromOffset(14, 30), TextSize = 12 }, true)
+    local clearBtn = glass(inputBar, "TextButton", 8)
+    clearBtn.Size, clearBtn.Position = UDim2.new(.45, -16, 0, 32), UDim2.new(.55, 2, 0, 30)
+    clearBtn.Text, clearBtn.Font, clearBtn.TextSize, clearBtn.TextColor3 = "clear log", Enum.Font.GothamBold, 11, C.text
+
+    track(hopBtn.MouseButton1Click:Connect(function()
+        if hopping then logWarn("already hopping...") return end
+        logInfo("manual hop triggered")
+        failStreak = 0
+        doHop()
+    end))
+    track(clearBtn.MouseButton1Click:Connect(function() logLines = {} logDirty = true end))
+
+    -- ===== SERVERS =====
+    local sScroll = scrollPage(pages.servers)
+    section(sScroll, "scanner", 0)
+    local statusCard = glass(sScroll, "Frame", 12, 1)
+    statusCard.Size = UDim2.new(1, 0, 0, 60)
+    U.serverStatus = text(statusCard, { Size = UDim2.new(1, -120, 1, 0), Position = UDim2.fromOffset(16, 0), Font = Enum.Font.GothamBold,
+        TextSize = 12, Text = "click refresh to scan" })
+    local refreshBtn = solidButton(statusCard, "refresh", pal.acc, { Size = UDim2.fromOffset(88, 32), Position = UDim2.new(1, -104, .5, -16) }, true)
+    track(refreshBtn.MouseButton1Click:Connect(function() U.refreshServerScan(true) end))
+    section(sScroll, "all servers · click to jump", 2)
+    U.serverListFrame = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3 }, sScroll)
+    make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, U.serverListFrame)
+    emptyCard(U.serverListFrame, "click refresh to scan servers")
+
+    -- ===== CONFIG =====
+    local tScroll = scrollPage(pages.config)
+    local n = counter()
+    section(tScroll, "appearance", n())
+
+    local themeCard = glass(tScroll, "Frame", 12, n())
+    themeCard.Size = UDim2.new(1, 0, 0, 72)
+    U.themeLabel = text(themeCard, { Size = UDim2.new(1, -28, 0, 14), Position = UDim2.fromOffset(14, 12), Font = Enum.Font.GothamBold,
+        TextSize = 10, TextColor3 = C.dim, Text = "theme · " .. themes[cfg.themeIdx].name })
+    local swatchRow = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -28, 0, 28), Position = UDim2.fromOffset(14, 32) }, themeCard)
+    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 10), VerticalAlignment = Enum.VerticalAlignment.Center }, swatchRow)
+
+    local swatches = {}
+    local function markSwatch(sel)
+        for i, s in ipairs(swatches) do
+            local on = i == sel
+            tw(s, { Color = on and WHITE or rgb(180, 185, 200), Thickness = on and 2 or 1, Transparency = on and .2 or .65 }, .26)
+        end
+    end
+    for i, t in ipairs(themes) do
+        local sw = make("TextButton", { BackgroundColor3 = t.rainbow and WHITE or t.pal.c1, Size = UDim2.fromOffset(26, 26), Text = "", LayoutOrder = i }, swatchRow)
+        corner(sw, 13)
+        if t.rainbow then
+            grad(sw, ColorSequence.new({ CSK(0, rgb(255,80,80)), CSK(.25, rgb(255,220,80)), CSK(.5, rgb(120,255,120)),
+                CSK(.75, rgb(120,180,255)), CSK(1, rgb(220,120,255)) }), NumberSequence.new(0), 45)
+        else
+            grad(sw, ColorSequence.new(WHITE:Lerp(t.pal.c1, .6), t.pal.c1), NumberSequence.new(0))
+        end
+        local on = i == cfg.themeIdx
+        swatches[i] = stroke(sw, on and 2 or 1, on and .2 or .65, on and WHITE or rgb(180, 185, 200))
+        track(sw.MouseEnter:Connect(function() tw(sw, { Size = UDim2.fromOffset(30, 30) }, .2, Enum.EasingStyle.Back) end))
+        track(sw.MouseLeave:Connect(function() tw(sw, { Size = UDim2.fromOffset(26, 26) }, .24) end))
+        track(sw.MouseButton1Click:Connect(function() setTheme(i, true) markSwatch(i) end))
+    end
+
+    section(tScroll, "scale", n())
+    local scaleCard = glass(tScroll, "Frame", 12, n())
+    scaleCard.Size = UDim2.new(1, 0, 0, 56)
+    local scaleLabel = text(scaleCard, { Size = UDim2.new(1, -180, 1, 0), Position = UDim2.fromOffset(16, 0), Font = Enum.Font.GothamBold,
+        Text = ("zoom · %.2f"):format(cfg.scale) })
+    local function setScale(v)
+        v = math.floor(clamp(v, .7, 1.5) * 100 + .5) / 100
+        cfg.scale = v
+        scaleLabel.Text = ("zoom · %.2f"):format(v)
+        tw(uiScale, { Scale = v }, .35, Enum.EasingStyle.Back)
+        saveCfg()
+    end
+    for order, def in ipairs({ { "−", function() setScale(cfg.scale - .1) end }, { "1", function() setScale(1) end }, { "+", function() setScale(cfg.scale + .1) end } }) do
+        local b = glass(scaleCard, "TextButton", 8)
+        b.Size, b.Position = UDim2.fromOffset(34, 30), UDim2.new(1, -12 - 34 * (4 - order) - 6 * (3 - order), .5, -15)
+        b.Text, b.Font, b.TextSize, b.TextColor3 = def[1], Enum.Font.GothamBold, 13, C.text
+        track(b.MouseButton1Click:Connect(def[2]))
+    end
+
+    local function toggleRow(label, key, order, onChange)
+        local b = glass(tScroll, "TextButton", 10, order)
+        b.Size = UDim2.new(1, 0, 0, 48)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16) }, b)
+        text(b, { Size = UDim2.new(1, -84, 1, 0), Font = Enum.Font.GothamMedium, TextSize = 12, Text = label })
+        local PW, PH, K = 40, 22, 18
+        local state = cfg[key]
+        local trackF = make("Frame", { Size = UDim2.fromOffset(PW, PH), Position = UDim2.new(1, -PW, .5, -PH / 2),
+            BackgroundColor3 = state and C.green or rgb(64, 66, 78) }, b)
+        corner(trackF, PH)
+        local knob = make("Frame", { Size = UDim2.fromOffset(K, K), BackgroundColor3 = WHITE,
+            Position = UDim2.new(0, state and (PW - K - 2) or 2, .5, -K / 2) }, trackF)
+        corner(knob, K)
+        track(b.MouseButton1Click:Connect(function()
+            state = not state
+            cfg[key] = state
+            saveCfg()
+            tw(knob, { Position = UDim2.new(0, state and (PW - K - 2) or 2, .5, -K / 2) }, .4, Enum.EasingStyle.Back)
+            tw(trackF, { BackgroundColor3 = state and C.green or rgb(64, 66, 78) }, .28)
+            if onChange then onChange(state) end
+        end))
+    end
+
+    section(tScroll, "behavior", n())
+    toggleRow("auto hop on join (needs autoexec)", "hopOnJoin", n())
+    toggleRow("prefer less full servers", "preferLessFull", n(), function() scanCache.t = 0 end)
+    section(tScroll, "limits", n())
+    toggleRow("skip empty servers", "skipEmpty", n(), function() scanCache.t = 0 end)
+    section(tScroll, "system", n())
+
+    local unloadBtn = make("TextButton", { BackgroundColor3 = rgb(180, 55, 70), BackgroundTransparency = .15,
+        Size = UDim2.new(1, 0, 0, 52), Text = "", LayoutOrder = n() }, tScroll)
+    corner(unloadBtn, 10)
+    grad(unloadBtn, ColorSequence.new(rgb(220, 75, 90), rgb(150, 40, 55)), NumberSequence.new(0))
+    stroke(unloadBtn, 1, .5, rgb(255, 200, 210))
+    text(unloadBtn, { Size = UDim2.new(1, 0, 0, 18), Position = UDim2.fromOffset(16, 10), Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = rgb(255, 245, 250), Text = "unload hopper" })
+    text(unloadBtn, { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.fromOffset(16, 30), TextSize = 10,
+        TextColor3 = rgb(255, 200, 210), Text = "removes the ui and disconnects everything" })
+    hover(unloadBtn, { BackgroundTransparency = 0 }, { BackgroundTransparency = .15 })
+    track(unloadBtn.MouseButton1Click:Connect(function() if _G.__hopper_unload then _G.__hopper_unload() end end))
+
+    -- ===== BLACKLIST =====
+    local bScroll = scrollPage(pages.blacklist)
+    section(bScroll, "stats", 0)
+    local statsCard = glass(bScroll, "Frame", 12, 1)
+    statsCard.Size = UDim2.new(1, 0, 0, 64)
+    U.statsCount = text(statsCard, { Size = UDim2.new(1, -28, 0, 20), Position = UDim2.fromOffset(14, 12), Font = Enum.Font.GothamBold,
+        TextSize = 14, Text = "0 blacklisted" })
+    U.statsSub = text(statsCard, { Size = UDim2.new(1, -28, 0, 14), Position = UDim2.fromOffset(14, 36), TextSize = 10, TextColor3 = C.mid, Text = "" })
+    section(bScroll, "actions", 2)
+    local actionRow = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 3 }, bScroll)
+    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, actionRow)
+    local clearAll = solidButton(actionRow, "clear all", rgb(200, 70, 85), { Size = UDim2.new(.5, -4, 1, 0), LayoutOrder = 1 })
+    local refreshBL = solidButton(actionRow, "refresh list", pal.acc, { Size = UDim2.new(.5, -4, 1, 0), LayoutOrder = 2 }, true)
+    section(bScroll, "servers", 4)
+    local blList = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 5 }, bScroll)
+    make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, blList)
+
+    local function age(t)
+        local d = os.time() - t
+        return d < 60 and (d .. "s") or d < 3600 and (math.floor(d / 60) .. "m") or (math.floor(d / 3600) .. "h")
+    end
+
+    function U.refreshBlacklist()
+        for _, c in ipairs(blList:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end
+        local ids = {}
+        for id, t in pairs(blacklist) do ids[#ids + 1] = { id = id, t = t } end
+        table.sort(ids, function(a, b) if a.t ~= b.t then return a.t > b.t end return a.id < b.id end)
+        U.statsCount.Text = #ids .. " blacklisted"
+        U.statsSub.Text = "current job: " .. (currentId and shortId(currentId) or "unknown") .. " · entries expire after 6h"
+        if #ids == 0 then emptyCard(blList, "no servers blacklisted yet") return end
+        for i = 1, math.min(#ids, MAX_ROWS) do
+            local e = ids[i]
+            local row = make("Frame", { BackgroundColor3 = WHITE, BackgroundTransparency = .9, Size = UDim2.new(1, 0, 0, 38), LayoutOrder = i }, blList)
+            corner(row, 10) grad(row, SOFT_C, NumberSequence.new(0.88, 0.95)) stroke(row, 1, .65)
+            text(row, { Size = UDim2.new(1, -150, 1, 0), Position = UDim2.fromOffset(14, 0), Font = Enum.Font.Code, TextSize = 10,
+                TextTruncate = Enum.TextTruncate.AtEnd, Text = e.id })
+            text(row, { Size = UDim2.fromOffset(40, 38), Position = UDim2.new(1, -124, 0, 0), Font = Enum.Font.Code, TextSize = 10,
+                TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Right, Text = age(e.t) })
+            local del = make("TextButton", { BackgroundColor3 = rgb(200, 70, 85), BackgroundTransparency = .2, Size = UDim2.fromOffset(70, 24),
+                Position = UDim2.new(1, -82, .5, -12), Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = rgb(255, 240, 245), Text = "remove" }, row)
+            corner(del, 7)
+            grad(del, ColorSequence.new(rgb(220, 90, 105), rgb(160, 50, 65)), NumberSequence.new(0))
+            del.MouseButton1Click:Connect(function()
+                blacklist[e.id] = nil
+                saveBL()
+                log("removed " .. shortId(e.id), C.yellow)
+                U.refreshBlacklist()
+            end)
+        end
+        if #ids > MAX_ROWS then
+            local f = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = MAX_ROWS + 1 }, blList)
+            text(f, { Size = UDim2.fromScale(1, 1), TextColor3 = C.dim, TextSize = 10, Text = ("+%d more not shown"):format(#ids - MAX_ROWS) })
+        end
+    end
+    track(clearAll.MouseButton1Click:Connect(function()
+        blacklist = {}
+        ban(currentId)
+        logWarn("blacklist cleared")
+        U.refreshBlacklist()
+    end))
+    track(refreshBL.MouseButton1Click:Connect(function() U.refreshBlacklist() end))
+
+    -- ===== minimize / pill =====
+    local minimized = false
+    track(btnMin.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        if minimized then
+            tw(win, { Size = UDim2.new(1, 0, 0, HEADER_H) }, .36)
+            content.Visible, tabsBar.Visible = false, false
+        else
+            content.Visible, tabsBar.Visible = true, true
+            tw(win, { Size = UDim2.fromScale(1, 1) }, .4)
         end
     end))
 
-    -- Main Window Body Frame
-    local mainFrame = Instance.new("Frame", container)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(20, 24, 38)
-    mainFrame.BackgroundTransparency = 0.15
-    mainFrame.Size = UDim2.new(1, 0, 1, 0)
-    mainFrame.BorderSizePixel = 0
-    mainFrame.ZIndex = 2
-    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 16)
-    
-    local bgGrad = Instance.new("UIGradient", mainFrame)
-    bgGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0.0, themes[currentThemeIdx].c1),
-        ColorSequenceKeypoint.new(0.5, themes[currentThemeIdx].c2),
-        ColorSequenceKeypoint.new(1.0, themes[currentThemeIdx].c3),
-    })
-    bgGrad.Rotation = 45
-    U.bgGrad = bgGrad
+    local pill = glass(gui, "TextButton", 23)
+    pill.Size, pill.Position, pill.Visible, pill.ZIndex = UDim2.fromOffset(160, 46), UDim2.new(.5, -80, 0, -60), false, 200
+    corner(make("ImageLabel", { BackgroundTransparency = 1, Size = UDim2.fromOffset(30, 30), Position = UDim2.new(0, 8, .5, -15),
+        Image = ICON, ZIndex = 201 }, pill), 15)
+    text(pill, { Size = UDim2.new(1, -76, 1, 0), Position = UDim2.fromOffset(46, 0), Font = Enum.Font.GothamBold, TextSize = 12,
+        Text = "server hopper", ZIndex = 201 })
+    U.pillDot = make("Frame", { BackgroundColor3 = C.red, Size = UDim2.fromOffset(8, 8), Position = UDim2.new(1, -24, .5, -4), ZIndex = 201 }, pill)
+    corner(U.pillDot, 4)
 
-    draggable(container, mainFrame)
+    function U.hideUI()
+        container.Visible = false
+        pill.Visible = true
+        pill.Position = UDim2.new(.5, -80, 0, -60)
+        tw(pill, { Position = UDim2.new(.5, -80, 0, 14) }, .46, Enum.EasingStyle.Back)
+    end
+    function U.showUI()
+        container.Visible = true
+        tw(pill, { Position = UDim2.new(.5, -80, 0, -60) }, .3, Enum.EasingStyle.Cubic, Enum.EasingDirection.In)
+        task.delay(.32, function() if container.Visible then pill.Visible = false end end)
+    end
+    track(btnClose.MouseButton1Click:Connect(U.hideUI))
+    track(pill.MouseButton1Click:Connect(U.showUI))
 
-    -- Header
-    local header = Instance.new("Frame", mainFrame)
-    header.BackgroundTransparency = 1
-    header.Size = UDim2.new(1, 0, 0, HEADER_H)
-    header.ZIndex = 3
-
-    local titleLbl = Instance.new("TextLabel", header)
-    titleLbl.BackgroundTransparency = 1
-    titleLbl.Position = UDim2.new(0, 16, 0, 0)
-    titleLbl.Size = UDim2.new(0, 200, 1, 0)
-    titleLbl.Font = Enum.Font.GothamBold
-    titleLbl.TextSize = 16
-    titleLbl.TextColor3 = C.text
-    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
-    titleLbl.Text = "Server Hopper"
-    titleLbl.ZIndex = 4
-
-    local themeLbl = Instance.new("TextLabel", header)
-    themeLbl.BackgroundTransparency = 1
-    themeLbl.Position = UDim2.new(0, 16, 0, 22)
-    themeLbl.Size = UDim2.new(0, 200, 1, 0)
-    themeLbl.Font = Enum.Font.Gotham
-    themeLbl.TextSize = 10
-    themeLbl.TextColor3 = C.textMid
-    themeLbl.TextXAlignment = Enum.TextXAlignment.Left
-    themeLbl.Text = "theme · " .. themes[currentThemeIdx].name
-    themeLbl.ZIndex = 4
-    U.themeLabel = themeLbl
-
-    -- Status Pill in Header
-    local pill = Instance.new("Frame", header)
-    pill.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    pill.BackgroundTransparency = 0.6
-    pill.Size = UDim2.new(0, 100, 0, 24)
-    pill.Position = UDim2.new(1, -116, 0.5, -12)
-    pill.ZIndex = 4
-    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
-
-    local pillDot = Instance.new("Frame", pill)
-    pillDot.BackgroundColor3 = C.green
-    pillDot.Size = UDim2.new(0, 6, 0, 6)
-    pillDot.Position = UDim2.new(0, 10, 0.5, -3)
-    pillDot.ZIndex = 5
-    Instance.new("UICorner", pillDot).CornerRadius = UDim.new(1, 0)
-    U.pillDot = pillDot
-
-    local pillText = Instance.new("TextLabel", pill)
-    pillText.BackgroundTransparency = 1
-    pillText.Position = UDim2.new(0, 22, 0, 0)
-    pillText.Size = UDim2.new(1, -22, 1, 0)
-    pillText.Font = Enum.Font.GothamMedium
-    pillText.TextSize = 10
-    pillText.TextColor3 = C.text
-    pillText.TextXAlignment = Enum.TextXAlignment.Left
-    pillText.Text = "ready"
-    pillText.ZIndex = 5
-    U.statusText = pillText
-    U.statusDot = pillDot
-
-    -- Content Area Container
-    local contentArea = Instance.new("Frame", mainFrame)
-    contentArea.BackgroundTransparency = 1
-    contentArea.Position = UDim2.new(0, 16, 0, HEADER_H + TABS_H + 8)
-    contentArea.Size = UDim2.new(1, -32, 1, -(HEADER_H + TABS_H + 24))
-    contentArea.ZIndex = 3
-
-    -- Server list tab frame
-    local serverListFrame = Instance.new("ScrollingFrame", contentArea)
-    serverListFrame.BackgroundTransparency = 1
-    serverListFrame.Size = UDim2.new(1, 0, 1, -50)
-    serverListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    serverListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    serverListFrame.ScrollBarThickness = 4
-    serverListFrame.ZIndex = 5
-    U.serverListFrame = serverListFrame
-
-    local listLayout = Instance.new("UIListLayout", serverListFrame)
-    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    listLayout.Padding = UDim.new(0, 6)
-
-    -- Quick hop button at bottom
-    local hopBtn = glassButton(contentArea, 44)
-    hopBtn.Position = UDim2.new(0, 0, 1, -44)
-    local hopBtnText = Instance.new("TextLabel", hopBtn)
-    hopBtnText.BackgroundTransparency = 1
-    hopBtnText.Size = UDim2.new(1, 0, 1, 0)
-    hopBtnText.Font = Enum.Font.GothamBold
-    hopBtnText.TextSize = 12
-    hopBtnText.TextColor3 = C.text
-    hopBtnText.Text = "Hop to Fresh Server Now"
-    hopBtnText.ZIndex = 6
-    track(hopBtn.MouseButton1Click:Connect(doHop))
-
-    setStatus("ok", "ready")
+    text(win, { Size = UDim2.fromOffset(120, 14), Position = UDim2.new(0, 14, 1, -16), TextSize = 9, TextColor3 = C.dim,
+        TextTransparency = .45, Text = VERSION, ZIndex = 40 })
 end
 
-buildUI()
-logGood("server hopper initialized (" .. VERSION .. ")")
+build()
+paint(pal)
+U.refreshBlacklist()
+
+-- ============ HEARTBEAT: log flush + rainbow (throttled, skipped while hidden) ============
+local acc = 0
+track(RunService.Heartbeat:Connect(function(dt)
+    local visible = U.container and U.container.Visible
+    if logDirty and visible and U.logsPage.Visible then
+        logDirty = false
+        U.logLabel.Text = table.concat(logLines, "\n")
+    end
+    if rainbowOn then
+        hue = (hue + dt * .08) % 1
+        acc = acc + dt
+        if acc >= 1 / 24 and not transitioning and visible then
+            acc = 0
+            paint(rainbowPal(hue))
+        end
+    end
+end))
+
+-- ============ INPUT ============
+track(UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    local k = input.KeyCode
+    if k == Enum.KeyCode.RightShift then
+        if U.container.Visible then U.hideUI() else U.showUI() end
+    elseif k == Enum.KeyCode.F2 and not hopping then
+        logInfo("hotkey hop (F2)")
+        failStreak = 0
+        doHop()
+    elseif k == Enum.KeyCode.F3 then
+        logInfo("hotkey scan servers (F3)")
+        U.refreshServerScan(true)
+    end
+end))
+
+-- ============ UNLOAD ============
+local function unload()
+    if unloaded then return end
+    unloaded = true
+    for _, c in ipairs(connections) do pcall(c.Disconnect, c) end
+    connections = {}
+    if themeTween then themeTween:Cancel() end
+    alpha:Destroy()
+    gui:Destroy()
+    _G.__hopper_unload = nil
+    print("[hopper] unloaded")
+end
+_G.__hopper_unload = unload
+
+-- ============ STARTUP ============
+do
+    local n = 0
+    for _ in pairs(blacklist) do n = n + 1 end
+    log("session " .. sessionId .. " started")
+    log("loaded " .. n .. " blacklisted servers")
+end
+log("current job: " .. (currentId and shortId(currentId) or "unknown"), currentId and C.mid or C.red)
+log("rightshift toggle · F2 hop · F3 scan · servers tab = browse")
+setStatus("ok", "ready")
+
+if cfg.hopOnJoin then
+    log("auto hop on join: ON — hopping in 3s (unload to cancel)", C.yellow)
+    task.delay(3, function() if not unloaded and not hopping then doHop() end end)
+end
