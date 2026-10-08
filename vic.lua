@@ -1353,7 +1353,7 @@ local function buildUI()
 
     section(sScroll, "scanner", 0)
 
-    local serverStatusCard = glasssSurface(sScroll, 1)
+    local serverStatusCard = glassSurface(sScroll, 1)
     serverStatusCard.Size = UDim2.new(1, 0, 0, 60)
 
     local serverListStatus = Instance.new("TextLabel", serverStatusCard)
