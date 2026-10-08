@@ -1,4 +1,4 @@
---// Server Hopper v0.4 — vicious bee + safe ColorSequence
+--// Server Hopper v0.5 — cool UI + old vicious bee detection
 local players = game:GetService("Players")
 local httpService = game:GetService("HttpService")
 local userInput = game:GetService("UserInputService")
@@ -16,7 +16,7 @@ _G.__hopper_loaded = true
 local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
 
 -- ============ CONSTANTS ============
-local VERSION = "v0.4 beta"
+local VERSION = "v0.5 beta"
 local iconId = "rbxthumb://type=Asset&id=79985085633622&w=150&h=150"
 local blacklistFile = "hopper_blacklist.json"
 local configFile = "hopper_config.json"
@@ -41,46 +41,13 @@ local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
 local WHITE = rgb(255, 255, 255)
 
 -- ============ SAFE COLORSEQUENCE ============
--- Wraps ColorSequence.new so any bad call (0 or 1 keypoint in a table, nil args, etc.)
--- is caught, logged with a traceback, and replaced with a safe fallback.
 local realColorSequenceNew = ColorSequence.new
-
 local function safeCS(...)
     local ok, res = pcall(realColorSequenceNew, ...)
     if ok and typeof(res) == "ColorSequence" then return res end
-
-    -- Log what went wrong
-    warn("[hopper] bad ColorSequence.new call — falling back to white")
-    warn("[hopper] traceback:")
+    warn("[hopper] bad ColorSequence.new call — falling back")
     warn(debug.traceback("", 2))
-
-    local n = select("#", ...)
-    if n == 1 then
-        local t = ...
-        if type(t) == "table" then
-            warn("[hopper] table arg had " .. #t .. " entries")
-            if #t >= 1 and t[1] and t[1].Value then
-                local v = t[1].Value
-                return realColorSequenceNew(v, v)
-            end
-        end
-    elseif n >= 2 then
-        warn("[hopper] called with " .. n .. " args")
-        -- try passing them through; if that fails, white/white
-        local ok2, res2 = pcall(realColorSequenceNew, ...)
-        if ok2 then return res2 end
-    end
     return realColorSequenceNew(WHITE, WHITE)
-end
-
--- Sanity check: does ColorSequence.new even work on this executor?
-do
-    local ok, err = pcall(function()
-        return realColorSequenceNew(Color3.new(1, 1, 1), Color3.new(0, 0, 0))
-    end)
-    if not ok then
-        warn("[hopper] ColorSequence.new is broken on this executor: " .. tostring(err))
-    end
 end
 
 local ck, nk = function(t, r, g, b) return ColorSequenceKeypoint.new(t, rgb(r, g, b)) end, NumberSequenceKeypoint.new
@@ -256,7 +223,8 @@ local config = {
     viciousBeeAutoRehop = true,
     viciousBeeWaitTime = 6,
     viciousBeeRecheckInterval = 10,
-    viciousBeeKeywords = {"viciousbee", "vicious_bee", "vicious bee", "vicious"},
+    -- folder names to look inside for the bee (case-insensitive)
+    viciousBeeFolders = {"Monsters", "monsters", "Enemies", "enemies", "NPCs", "npcs", "Mobs", "mobs"},
 }
 local persistConfig = {
     themeIdx = 1, scale = 1, preferLessFull = true, skipEmpty = true, hopOnJoin = false,
@@ -360,60 +328,60 @@ local function shortId(id)
     return #id > 10 and id:sub(1, 10) or id
 end
 
--- ============ VICIOUS BEE DETECTION ============
-local function normalizeName(s)
-    return (tostring(s):lower():gsub("[%s_%-%.]", ""))
-end
-
-local vbeeKeywordsCache = nil
-local function getVbeeKeywords()
-    if vbeeKeywordsCache then return vbeeKeywordsCache end
-    local kw = {}
-    for _, k in ipairs(config.viciousBeeKeywords) do
-        kw[#kw + 1] = normalizeName(k)
-    end
-    vbeeKeywordsCache = kw
-    return kw
+-- ============ VICIOUS BEE DETECTION (old Monsters-folder logic) ============
+-- Old logic: the Vicious Bee lives inside a "Monsters" folder (or similar)
+-- in workspace. Walk that folder and check for anything with "vicious" in the name.
+local function isViciousName(name)
+    local n = tostring(name):lower()
+    return n:find("vicious", 1, true) ~= nil
 end
 
 local function checkForViciousBee()
-    local kw = getVbeeKeywords()
-    if #kw == 0 then return nil, 0 end
-
-    local found = nil
     local scanned = 0
-    local MAX_SCAN = 6000
-    local MAX_DEPTH = 4
+    local containerFound = nil
+    local found = nil
 
-    local function matches(name)
-        local n = normalizeName(name)
-        for i = 1, #kw do
-            if n:find(kw[i], 1, true) then return true end
+    -- Try each known folder name in order
+    for _, folderName in ipairs(config.viciousBeeFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if not folder then
+            -- also try case-insensitive scan of workspace children (covers odd capitalizations)
+            for _, child in ipairs(workspace:GetChildren()) do
+                if tostring(child.Name):lower() == folderName:lower() then
+                    folder = child
+                    break
+                end
+            end
         end
-        return false
+
+        if folder then
+            containerFound = folder
+            local kids = folder:GetChildren()
+            for i = 1, #kids do
+                scanned = scanned + 1
+                local k = kids[i]
+                if isViciousName(k.Name) then
+                    found = k
+                    break
+                end
+            end
+        end
+        if found then break end
     end
 
-    local function scan(container, depth)
-        if found or depth > MAX_DEPTH then return end
-        local children = container:GetChildren()
-        for i = 1, #children do
-            if found or scanned >= MAX_SCAN then return end
-            local c = children[i]
+    -- Fallback: no Monsters folder anywhere — do a shallow workspace scan
+    -- for anything named like the bee directly (belt-and-suspenders).
+    if not containerFound then
+        for _, child in ipairs(workspace:GetChildren()) do
             scanned = scanned + 1
-            if matches(c.Name) then
-                found = c
-                return
-            end
-            if c:IsA("Model") or c:IsA("Folder") or c:IsA("Tool") or c:IsA("Accessory") then
-                scan(c, depth + 1)
+            if isViciousName(child.Name) then
+                found = child
+                break
             end
         end
     end
 
-    scan(workspace, 0)
-    if not found then scan(replicatedStorage, 0) end
-
-    return found, scanned
+    return found, scanned, containerFound
 end
 
 -- ============ GUI ROOT + UNLOAD ============
@@ -1478,13 +1446,17 @@ function startViciousBeeMonitor()
         task.wait(config.viciousBeeWaitTime)
         if unloaded or my ~= vbeeMonitorToken then return end
 
-        local bee, scanned = checkForViciousBee()
+        local bee, scanned, folder = checkForViciousBee()
         if bee then
-            logGood("vicious bee found: " .. bee:GetFullName() .. " (" .. scanned .. " checked)")
+            logGood("vicious bee found: " .. bee:GetFullName() .. " (" .. scanned .. " checked in " ..
+                (folder and folder.Name or "workspace") .. ")")
             setStatus("bee", "bee found")
             if U.headerSub then U.headerSub.Text = "bee · " .. bee.Name end
         else
-            logWarn("vicious bee not found (" .. scanned .. " objects checked)")
+            logWarn("vicious bee not found (" .. scanned .. " checked)")
+            if not folder then
+                logWarn("no Monsters folder found in workspace")
+            end
             setStatus("ok", "no bee")
             if config.viciousBeeAutoRehop and not hopping then
                 logInfo("auto-rehop to find a fresh server")
@@ -1526,9 +1498,9 @@ track(userInput.InputBegan:Connect(function(input, gpe)
         logInfo("hotkey scan servers (F3)")
         U.refreshServerScan()
     elseif input.KeyCode == Enum.KeyCode.F4 then
-        local bee, scanned = checkForViciousBee()
+        local bee, scanned, folder = checkForViciousBee()
         if bee then
-            logGood("bee found: " .. bee:GetFullName())
+            logGood("bee found: " .. bee:GetFullName() .. " in " .. (folder and folder.Name or "workspace"))
         else
             logWarn("no bee found (" .. scanned .. " checked)")
         end
